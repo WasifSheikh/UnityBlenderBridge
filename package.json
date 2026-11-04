@@ -1,0 +1,10 @@
+{
+  "name": "com.auleek.blenderbridge",
+  "displayName": "Blender Bridge",
+  "version": "0.1.0",
+  "unity": "6000.0",
+  "description": "Edit Unity scenes with Blender's tools. The Unity scene stays the source of truth: Open in Blender builds a throwaway .blend from the scene and the project's asset library, and Sync to Unity applies moves, duplicates, new prefab instances and newly modelled assets back to the scene.",
+  "keywords": ["blender", "level design", "editor"],
+  "author": { "name": "Auleek" },
+  "dependencies": {}
+}

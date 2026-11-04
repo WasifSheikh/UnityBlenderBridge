@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.cs text diff=csharp
+*.py text diff=python
+*.meta text
