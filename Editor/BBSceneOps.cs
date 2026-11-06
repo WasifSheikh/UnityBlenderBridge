@@ -193,7 +193,14 @@ namespace Auleek.BlenderBridge.Editor
                 if (go.TryGetComponent<MeshRenderer>(out var mr))
                 {
                     Undo.RecordObject(mr, "Blender geometry");
-                    mr.sharedMaterials = src[0].sharedMaterials;
+                    if (BBRegistry.Get(key)?.materialMode == "unity")
+                    {
+                        var previous = mr.sharedMaterials;
+                        var materials = new Material[newMesh.subMeshCount];
+                        for (int i = 0; i < materials.Length; i++) materials[i] = i < previous.Length ? previous[i] : BBMaterialWriter.UnityDefaultMaterial();
+                        mr.sharedMaterials = materials;
+                    }
+                    else mr.sharedMaterials = src[0].sharedMaterials;
                 }
                 foreach (var mc in go.GetComponents<MeshCollider>())
                     if (!mc.sharedMesh || mc.sharedMesh == oldMesh) { Undo.RecordObject(mc, "Blender geometry"); mc.sharedMesh = newMesh; }

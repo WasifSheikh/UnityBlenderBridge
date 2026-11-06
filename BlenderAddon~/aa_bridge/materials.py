@@ -2,6 +2,7 @@
 (Editor/BBMaterialWriter.cs). Materials that came from Unity (aa_key) are only referenced: Unity keeps the real one."""
 import hashlib
 import os
+import uuid
 import shutil
 
 import bpy
@@ -34,9 +35,24 @@ def image_from(socket):
     return None
 
 
+def project_asset_path(value):
+    """Validate a project-relative Unity asset marker without permitting traversal or absolute paths."""
+    parts = str(value or '').replace('\\', '/').split('/')
+    if len(parts) < 2 or parts[0] != 'Assets' or any(p in ('', '.', '..') or ':' in p or '\0' in p for p in parts):
+        return ''
+    return '/'.join(parts)
+
+
 def project_asset(img, project):
     """'Assets/...' when the image file is already part of the Unity project (then Unity reuses it), else ''."""
-    if img is None or img.packed_file is not None or not img.filepath or not project:
+    if img is None or img.packed_file is not None or not project:
+        return ''
+    marker = project_asset_path(img.get('aa_project_path'))
+    if marker:
+        # A Unity move may have made the old file path unavailable. Keep its identity for Unity's alias
+        # resolver rather than exporting cached/placeholder pixels as a new texture.
+        return marker
+    if not img.filepath:
         return ''
     p = os.path.abspath(bpy.path.abspath(img.filepath))
     a = os.path.abspath(os.path.join(project, 'Assets'))
@@ -135,8 +151,9 @@ class Images:
 class Fingerprint:
     """Same interpretation as Images, without writing files: used to tell whether two models are the same asset."""
 
-    def __init__(self, project):
+    def __init__(self, project, material_mode='blender', sync_textures=True):
         self.project = project
+        self.material_mode, self.sync_textures = material_mode, sync_textures
         self.images = {}
         self.materials = {}
 
@@ -159,16 +176,36 @@ class Fingerprint:
         if m is None:
             return None
         if m not in self.materials:
-            d = describe(m, self)
+            if self.material_mode == 'unity':
+                self.materials[m] = {'name': m.name, 'unity': m.get('aa_key', '')}
+                return self.materials[m]
+            d = describe(m, self, self.sync_textures)
             del d['name']
+            d.pop('id', None)  # Ownership identity does not change the visible material fingerprint.
             self.materials[m] = d
         return self.materials[m]
 
 
-def describe(m, images):
+def reference(m):
+    """Only slot/identity information; Unity owns this material's settings and textures."""
+    r = {'name': m.name, 'unity': m.get('aa_key', '')}
+    if not r['unity']:
+        if m.get('aa_bb_material_id'):
+            r['id'] = m['aa_bb_material_id']
+        elif m.library is not None:
+            identity = os.path.normcase(os.path.realpath(bpy.path.abspath(m.library.filepath))) + '|' + m.name
+            r['id'] = uuid.uuid5(uuid.NAMESPACE_URL, 'blender-material:' + identity).hex
+        else:
+            m['aa_bb_material_id'] = uuid.uuid4().hex
+            r['id'] = m['aa_bb_material_id']
+    return r
+
+
+def describe(m, images, sync_textures=True):
     r = {'name': m.name, 'unity': m.get('aa_key', ''), 'color': list(m.diffuse_color), 'metallic': 0.0, 'smoothness': 0.5, 'normalScale': 1.0,
          'alpha': 'opaque', 'cutoff': 0.5, 'emission': [0, 0, 0], 'baseMap': '', 'normalMap': '', 'maskMap': '', 'emissionMap': ''}
     nt = node_tree(m)
+    r.update(reference(m))
     if r['unity'] or nt is None:
         return r  # a Unity material: Unity keeps using the real one
     nodes = nt.nodes
@@ -186,7 +223,7 @@ def describe(m, images):
     if bsdf is None:
         return r
     inp = bsdf.inputs
-    base = image_from(inp['Base Color'])
+    base = image_from(inp['Base Color']) if sync_textures else None
     if base is not None:
         r['baseMap'] = images.save(base)
         r['color'] = [1, 1, 1, 1]
@@ -202,7 +239,7 @@ def describe(m, images):
             gt = a.links[0].from_node
             if gt.type == 'MATH' and gt.operation == 'GREATER_THAN':
                 r['cutoff'] = gt.inputs[1].default_value
-    mi, ri = image_from(inp['Metallic']), image_from(inp['Roughness'])
+    mi, ri = (image_from(inp['Metallic']), image_from(inp['Roughness'])) if sync_textures else (None, None)
     if mi is not None or ri is not None:
         r['maskMap'] = images.mask(mi, ri, inp['Metallic'].default_value, inp['Roughness'].default_value, m.name)
     r['metallic'] = float(inp['Metallic'].default_value)
@@ -210,14 +247,14 @@ def describe(m, images):
     n = inp['Normal']
     if n.is_linked and n.links[0].from_node.type == 'NORMAL_MAP':
         nm = n.links[0].from_node
-        img = image_from(nm.inputs['Color'])
+        r['normalScale'] = float(nm.inputs['Strength'].default_value)
+        img = image_from(nm.inputs['Color']) if sync_textures else None
         if img is not None:
             r['normalMap'] = images.save(img)
-            r['normalScale'] = float(nm.inputs['Strength'].default_value)
     ec, es = inp.get('Emission Color'), inp.get('Emission Strength')
     strength = es.default_value if es is not None else 0.0
     if ec is not None and strength > 0:
-        img = image_from(ec)
+        img = image_from(ec) if sync_textures else None
         if img is not None:
             r['emissionMap'] = images.save(img)
             r['emission'] = [strength] * 3

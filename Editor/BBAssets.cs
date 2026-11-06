@@ -117,17 +117,14 @@ namespace Auleek.BlenderBridge.Editor
             AssetDatabase.FindAssets(search + " t:" + type).Select(AssetDatabase.GUIDToAssetPath).FirstOrDefault(p => Path.GetFileNameWithoutExtension(p) == fileName);
 
         /// <summary>SM_&lt;key&gt; model: by label first; models made before labels by their folder layout (…/Meshes/SM_key).</summary>
-        public static string FindModel(string key) =>
-            ByName("l:" + KeyLabel + key, "SM_" + key, "Model")
-            ?? AssetDatabase.FindAssets("SM_" + key + " t:Model").Select(AssetDatabase.GUIDToAssetPath)
-                            .FirstOrDefault(p => Path.GetFileNameWithoutExtension(p) == "SM_" + key && p.Replace('\\', '/').Contains("/Meshes/"));
+        public static string FindModel(string key) => BBRegistry.FindModel(key);
 
-        public static string FindPrefab(string key) =>
-            ByName("l:" + Label, "PF_" + key, "Prefab")
-            ?? AssetDatabase.FindAssets("l:" + KeyLabel + key + " t:Prefab").Select(AssetDatabase.GUIDToAssetPath).FirstOrDefault();
+        public static string FindPrefab(string key) => BBRegistry.FindPrefab(key);
 
         public static string SourceBlendForKey(string key)
         {
+            var record = BBRegistry.Get(key);
+            if (record != null) return BBPaths.Full(record.source);
             string m = FindModel(key);
             return m == null ? "" : BBPaths.Full(Path.GetDirectoryName(Path.GetDirectoryName(m)).Replace('\\', '/') + "/Source~/" + key + ".blend");
         }
@@ -136,8 +133,11 @@ namespace Auleek.BlenderBridge.Editor
         public static string KeyOfModelMesh(UMesh mesh)
         {
             string p = AssetDatabase.GetAssetPath(mesh);
-            if (string.IsNullOrEmpty(p) || !Path.GetFileName(p).StartsWith("SM_") || !p.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase)) return null;
-            string key = KeyFromLabels(AssetDatabase.LoadMainAssetAtPath(p)) ?? Path.GetFileNameWithoutExtension(p).Substring(3);
+            if (string.IsNullOrEmpty(p) || !p.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase)) return null;
+            string key = BBRegistry.instance.assets.FirstOrDefault(a => a.modelGuid == AssetDatabase.AssetPathToGUID(p))?.key
+                ?? KeyFromLabels(AssetDatabase.LoadMainAssetAtPath(p));
+            if (key == null && Path.GetFileName(p).StartsWith("SM_")) key = Path.GetFileNameWithoutExtension(p).Substring(3);
+            if (key == null) return null;
             return FindModel(key) == p ? key : null;
         }
 
@@ -174,25 +174,32 @@ namespace Auleek.BlenderBridge.Editor
 
         public static Imported Import(BBOutAsset a, BBSession s, List<string> log, string backupDir)
         {
-            string key = BBUtil.Slug(a.key);
-            string existing = FindModel(key);
-            if (a.isNew && KeyTaken(key))
+            var route = BBRegistry.Resolve(a, s);
+            string key = route.key, root = route.root;
+            BBRegistry.Begin(route, a, s);
+            if (a.metadataOnly)
             {
-                string b = key;
-                for (int i = 2; KeyTaken(key = b + "_" + i); i++) { }
-                existing = null;
+                BBRegistry.Commit(route, a, s, route.model, route.prefab);
+                return new Imported { key = key, prefab = route.prefab, model = route.model };
             }
-            string root = existing != null ? Path.GetDirectoryName(Path.GetDirectoryName(existing)).Replace('\\', '/') : s.assetRoot;
-            foreach (var sub in new[] { "Meshes", "Materials", "Prefabs" }) EnsureFolder(root + "/" + sub);
-            Directory.CreateDirectory(BBPaths.Full(root + "/Source~"));
+            foreach (var sub in new[] { "Meshes", "Prefabs" }) EnsureFolder(root + "/" + sub);
+            Directory.CreateDirectory(Path.GetDirectoryName(BBPaths.Full(route.source)));
             string src = a.dir.Replace('\\', '/');
 
-            var mats = BBMaterialWriter.Build(a, key, root, src, log);
+            bool unityMaterials = route.materialMode == "unity";
+            string materialPrefab = route.prefab;
+            if (!File.Exists(BBPaths.Full(materialPrefab)) && !string.IsNullOrEmpty(a.prefab) && a.prefab.StartsWith("prefab:"))
+                materialPrefab = AssetDatabase.GUIDToAssetPath(a.prefab.Substring(7));
+            var preservedMaterials = unityMaterials ? BBPrefabBuilder.CaptureMaterials(materialPrefab) : null;
+            var mats = BBMaterialWriter.Build(a, route, src, log);
 
             // model
-            string model = $"{root}/Meshes/SM_{key}.fbx";
+            string model = route.model;
             File.Copy(src + "/" + a.fbx, BBPaths.Full(model), true);
             AssetDatabase.ImportAsset(model, ImportAssetOptions.ForceUpdate);
+            AddLabels(AssetDatabase.LoadMainAssetAtPath(model), KeyLabel + key);
+            route.record.modelGuid = AssetDatabase.AssetPathToGUID(model);
+            BBRegistry.SaveNow();
             if (!(AssetImporter.GetAtPath(model) is ModelImporter mi)) throw new Exception($"{model} did not import as a model");
             mi.globalScale = 1f;
             mi.useFileScale = true;
@@ -207,13 +214,22 @@ namespace Auleek.BlenderBridge.Editor
             mi.isReadable = false;
             mi.generateSecondaryUV = !a.hasUv2;   // keep a lightmap UV made in Blender
             mi.materialImportMode = ModelImporterMaterialImportMode.ImportViaMaterialDescription;
+            if (unityMaterials)
+            {
+                mi.materialLocation = ModelImporterMaterialLocation.InPrefab;
+                var fallback = BBMaterialWriter.UnityDefaultMaterial();
+                foreach (var material in AssetDatabase.LoadAllAssetsAtPath(model).OfType<Material>())
+                    if (!mats.ContainsKey(material.name)) mats[material.name] = fallback;
+            }
             foreach (var kv in mats) mi.AddRemap(new AssetImporter.SourceAssetIdentifier(typeof(Material), kv.Key), kv.Value);
             mi.SaveAndReimport();
             AddLabels(AssetDatabase.LoadMainAssetAtPath(model), KeyLabel + key);
+            route.record.modelGuid = AssetDatabase.AssetPathToGUID(model);
+            BBRegistry.SaveNow();
 
             // editable source for the next Blender session
             if (!string.IsNullOrEmpty(a.source) && File.Exists(src + "/" + a.source))
-                File.Copy(src + "/" + a.source, BBPaths.Full($"{root}/Source~/{key}.blend"), true);
+                File.Copy(src + "/" + a.source, BBPaths.Full(route.source), true);
 
             // a modelled prefab: into the prefab itself (all copies) or into a Prefab Variant of it (this instance)
             string mode = a.mode ?? "";
@@ -229,33 +245,35 @@ namespace Auleek.BlenderBridge.Editor
             if (mode == "source")
             {
                 if (!string.IsNullOrEmpty(backupDir)) File.Copy(BBPaths.Full(original), Path.Combine(backupDir, Path.GetFileName(original)), true);
-                BBPrefabBuilder.ApplyParts(original, model, a, log);
+                BBPrefabBuilder.ApplyParts(original, model, a, log, unityMaterials, preservedMaterials);
                 prefabPath = original;
                 AddLabels(AssetDatabase.LoadAssetAtPath<GameObject>(prefabPath), KeyLabel + key);
             }
             else if (mode == "variant" && original != null)
             {
-                prefabPath = $"{root}/Prefabs/PF_{key}.prefab";
-                if (!File.Exists(BBPaths.Full(prefabPath))) BBPrefabBuilder.SaveVariant(original, prefabPath, "PF_" + key);
-                BBPrefabBuilder.ApplyParts(prefabPath, model, a, log);
+                prefabPath = route.prefab;
+                if (!File.Exists(BBPaths.Full(prefabPath))) BBPrefabBuilder.SaveVariant(original, prefabPath, "PF_" + route.assetName);
+                BBPrefabBuilder.ApplyParts(prefabPath, model, a, log, unityMaterials, preservedMaterials);
                 AddLabels(AssetDatabase.LoadAssetAtPath<GameObject>(prefabPath), Label, KeyLabel + key);
             }
             else
             {
                 // a new model: a variant of the model, so a re-import updates every instance
-                prefabPath = $"{root}/Prefabs/PF_{key}.prefab";
+                prefabPath = route.prefab;
                 var meta = ReadMeta(prefabPath);
-                BBPrefabBuilder.BuildModelPrefab(model, prefabPath, "PF_" + key, a, meta?.collider ?? "mesh");
+                BBPrefabBuilder.BuildModelPrefab(model, prefabPath, "PF_" + route.assetName, a, meta?.collider ?? "mesh", preservedMaterials);
                 AddLabels(AssetDatabase.LoadAssetAtPath<GameObject>(prefabPath), Label, KeyLabel + key);
             }
             AssetDatabase.SaveAssets();
             WriteMeta(prefabPath, new BBAssetMeta { collider = a.collider, parts = PartsSignature(AssetDatabase.LoadAssetAtPath<GameObject>(prefabPath)) });
+            BBRegistry.Commit(route, a, s, model, prefabPath);
             return new Imported { key = key, prefab = prefabPath, model = model };
         }
 
         public static void EnsureFolder(string path)
         {
             if (AssetDatabase.IsValidFolder(path)) return;
+            BBRegistry.AssetPath(path);
             string parent = Path.GetDirectoryName(path).Replace('\\', '/');
             EnsureFolder(parent);
             AssetDatabase.CreateFolder(parent, Path.GetFileName(path));

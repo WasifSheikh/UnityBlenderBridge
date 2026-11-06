@@ -30,7 +30,7 @@ def resume(path):
 # The stub registers the Unity panel only for files that are bridge sessions, and imports the bridge from the folder
 # recorded in that file (aa_tools), so each project's session uses its own version of the package. TOOLS (the last
 # project that launched Blender) is the fallback when that folder is gone (e.g. the package was updated).
-STUB_TEXT = '''bl_info = {{"name": "Unity Blender Bridge", "author": "Auleek", "version": (2, 0, 0), "blender": (4, 2, 0),
+STUB_TEXT = '''bl_info = {{"name": "Unity Blender Bridge", "author": "Auleek", "version": {release_version}, "blender": (4, 2, 0),
            "location": "3D View > Sidebar > Unity", "description": "Panel for scenes opened from Unity (Blender Bridge)",
            "category": "Import-Export"}}
 import os
@@ -90,7 +90,8 @@ def _install_stub():
         import addon_utils
         folder = bpy.utils.user_resource('SCRIPTS', path='addons', create=True)
         path = os.path.join(folder, STUB + '.py')
-        text = STUB_TEXT.format(tools=TOOLS)
+        from .version import current
+        text = STUB_TEXT.format(tools=TOOLS, release_version=tuple(int(n) for n in current().split('.')))
         current = open(path, encoding='utf-8').read() if os.path.exists(path) else None
         if current != text:
             with open(path, 'w', encoding='utf-8', newline='\n') as f:

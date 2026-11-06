@@ -73,12 +73,35 @@ off the source files. Keep the same geometry and pivot for copies that should sh
 
 ## What Unity makes from a Blender model (key K)
 
-Under the **Asset root** setting (default `Assets/BlenderBridge/{scene}`, `{scene}` = scene name): `Meshes/SM_K.fbx`,
-`Materials/M_K_<material>.mat` (URP Lit), `Textures/K/T_K_<material>_BC|N|MS|E.png` (textures already in the project
-are reused, not copied), `Prefabs/PF_K.prefab` (static, with colliders, label `BlenderAsset`), and `Source~/K.blend`,
-the editable source the next Blender session uses. The model and every prefab built from K carry the label `BBKey_K`,
-which is how they are found again even if the asset root setting changes. Re-syncing an edited asset updates these in
-place, so every instance follows. A UV2 made in Blender is kept as the lightmap UV; otherwise Unity generates one.
+Choose a **Destination** profile and an **Asset name** in Blender's Unity panel or Unity's sync review. Profiles
+define an art leaf folder, an `ArtSource/` source folder, and an optional set code. Project and scene defaults
+apply to new assets. An unresolved destination opens review instead of importing into a tool-specific folder.
+
+The art leaf receives `Meshes/SM_<Name>.fbx` and `Prefabs/PF_<Name>.prefab` (static, with colliders).
+Choose the material policy in Blender or Unity's import review:
+
+- **Use Unity materials** keeps materials assigned in Unity and imports geometry only. New material slots use a
+  Unity default until you assign one. It creates no material or texture files.
+- **Sync Blender materials, without textures** imports material colors and scalar values while keeping existing
+  Unity texture assignments. It does not copy, resolve, or clear texture maps.
+- **Sync Blender materials and textures** also writes Blender-owned URP Lit materials to
+  `Materials/M_<Name>_<Material>.mat` and image maps to `Textures/T_<Name>_<Material>_BC|N|MS|E.png`.
+
+Project defaults apply only to new assets; existing assets keep their registered policy until explicitly changed.
+This project's new-asset default is **Use Unity materials**. Existing Unity materials referenced by Blender remain
+reused under either policy. Editable `.blend` sources go below project-root `ArtSource/`.
+Prefixes are added once. Hierarchy instance names are independent of the shared asset name.
+
+`ProjectSettings/BlenderBridgeRegistry.asset` stores immutable keys and GUIDs for models, prefabs, owned
+materials and textures, plus exact source paths. Commit it with the assets. Existing legacy keys and `BBKey_K`
+labels are retained. Adoption records the old files in place, including their old source paths; it does not move
+or rename them. Changing an existing asset's destination/name records a proposal for a later migration only.
+Re-sync resolves registered GUIDs and updates the same assets even after a Unity move/rename. Missing registered
+assets and occupied new destinations stop import rather than creating replacements or overwriting unrelated files.
+Internal FBX part names remain stable to preserve mesh fileIDs. A Blender UV2 is retained; otherwise Unity creates it.
+
+Open a fresh bridge session after updating the package to receive the current profiles and controls; preserve
+any unsynced work first. Old version-2 sessions remain readable, and Unity uses current project profiles when importing.
 
 ## Good to know
 
@@ -86,7 +109,8 @@ place, so every instance follows. A UV2 made in Blender is kept as the lightmap 
   on the Unity transform unless you apply them in Blender. Moving the pivot of a shared prefab ("all copies") shifts the
   geometry of the other copies; Unity holds that sync for review with a warning.
 - Blender shows Unity materials approximately (custom shaders become base colour/texture, normal, metal/smooth).
-  Unity keeps the real materials. Materials of Blender-made assets are owned by Blender: a re-sync overwrites them.
+  Unity keeps the real materials. Only Blender-owned materials with **Sync Blender materials** enabled are updated
+  from Blender; **Use Unity materials** preserves Unity assignments during geometry re-syncs.
 - If the same object changed in Unity and in Blender since the last sync, Unity's version is kept unless you tick it
   (or press *Take Blender's for all*). Transforms are compared relative to the parent, so moving a group in one place
   doesn't make its children conflict.
@@ -95,12 +119,15 @@ place, so every instance follows. A UV2 made in Blender is kept as the lightmap 
 - Objects added under a prefab instance in the scene are editable in Blender too.
 - New lights, cameras and empties made in Blender are not sent to Unity.
 - Geometry Nodes instances should be realized (Object > Apply > Visual Geometry to Mesh) before syncing.
-- Blender-made source files (`Source~/*.blend`) are committed with packed textures; consider Git LFS for `*.blend`.
+- Blender-made sources in `ArtSource/` are committed with packed external textures; consider Git LFS for `*.blend`.
+  Older projects can keep their explicitly registered source paths until they choose to migrate them.
 
 ## Settings
 
 `ProjectSettings/BlenderBridge.asset` (commit it): editable roots per scene, library folders (what appears in
-Blender's Asset Browser) and paths to leave out, auto-apply, and the asset root. The Blender executable is stored per PC.
+Blender's Asset Browser) and paths to leave out, auto-apply, destination profiles and scene/project defaults.
+The old asset root remains for legacy compatibility. New assets require a configured destination profile.
+The Blender executable is stored per PC. The registry is stored separately in `ProjectSettings/BlenderBridgeRegistry.asset`.
 
 To put the window in your own menu, call `Auleek.BlenderBridge.Editor.BBWindow.Open()` from a `[MenuItem]` of yours
 (the assembly is auto-referenced), or `EditorApplication.ExecuteMenuItem("Tools/Blender Bridge")`.

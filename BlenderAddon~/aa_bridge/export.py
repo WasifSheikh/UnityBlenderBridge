@@ -178,7 +178,9 @@ def collection_model(placement):
                     for prop in list(obj.keys()):
                         if prop.startswith('aa_'):
                             del obj[prop]
-                    obj['aa_fbx_name'] = source.name
+                    obj['aa_fbx_name'] = source.get('aa_fbx_name') or source.name
+                    if source.get('aa_part') is not None:
+                        obj['aa_part'] = source['aa_part']
                     obj.animation_data_clear()
                     obj.constraints.clear()
                     scene_collection.objects.link(obj)
@@ -255,11 +257,13 @@ def export_asset(root, key, out_dir, is_new, project='', node=''):
         for s in getattr(o, 'material_slots', []):
             if s.material is not None and s.material not in mats:
                 mats.append(s.material)
-    images = M.Images(os.path.join(d, 'Textures'), project)
+    material_mode = str(root.get('aa_material_mode', 'blender'))
+    sync_textures = bool(root.get('aa_sync_textures', True))
+    images = M.Images(os.path.join(d, 'Textures'), project) if material_mode != 'unity' and sync_textures else None
     bpy.context.view_layer.update()
     to_root = root.matrix_world.inverted_safe()
     rel = {o: flat(to_root @ o.matrix_world) for o in parts}  # before the root is moved to the origin for export
-    materials = [M.describe(m, images) for m in mats]
+    materials = [M.reference(m) if material_mode == 'unity' else M.describe(m, images, sync_textures) for m in mats]
     h = asset_hash(root)
     geo = [o for o in parts if o.type in GEO]
     has_uv2 = any(o.type == 'MESH' and len(o.data.uv_layers) > 1 for o in geo)
@@ -313,4 +317,4 @@ def export_asset(root, key, out_dir, is_new, project='', node=''):
                        'depth': _depth(o, parts)} for o in geo],
             'removed': [p for p in original if p not in known],
             'collider': str(root.get('collider', 'mesh')), 'hash': h, 'dir': d.replace('\\', '/'), 'isNew': is_new, 'node': node,
-            'hasUv2': has_uv2, 'materials': materials}
+            'hasUv2': has_uv2, 'materials': materials, 'materialMode': material_mode, 'syncTextures': sync_textures}

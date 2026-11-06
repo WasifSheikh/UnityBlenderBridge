@@ -21,6 +21,20 @@ namespace Auleek.BlenderBridge.Editor
     //   <root>/Meshes/SM_<key>.fbx, Materials/, Textures/<key>/, Prefabs/PF_<key>.prefab, Source~/<key>.blend
     // =====================================================================================================
 
+    public static class BBVersion
+    {
+        [Serializable] class Release { public string version = ""; }
+        public static string Current
+        {
+            get
+            {
+                var package=UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(BBVersion).Assembly);
+                string path=package == null ? "" : Path.Combine(package.resolvedPath,"package.json");
+                return File.Exists(path) ? JsonUtility.FromJson<Release>(File.ReadAllText(path)).version : package?.version ?? "unknown";
+            }
+        }
+    }
+
     public static class BBPaths
     {
         static string project, tools;

@@ -1,7 +1,7 @@
 """3D View > Sidebar (N) > Unity."""
 import bpy
 
-from . import model, sync
+from . import model, sync, routing, session, policy, auto_save, version
 from .common import CONTEXT
 
 
@@ -104,6 +104,125 @@ def _new_roots(context):
     return [o for o in context.selected_objects if model.is_new_model(o) or model.is_edit_root(o) or model.collection_placement(o)]
 
 
+def _import_roots(context):
+    return [o for o in _new_roots(context) if not o.get('aa_locked') and
+            (not model.is_instance(o) or routing.asset_key(o))]
+
+
+_destination_items = []  # Blender enum item strings must stay alive after its callback returns.
+
+
+def _destinations(self, context):
+    global _destination_items
+    S = session.load() or {}
+    items = [('__SCENE_DEFAULT__', 'Scene default', 'Use the destination configured for this scene in Unity'),
+             ('__UNITY_REVIEW__', 'Choose in Unity', 'Hold this asset for an import destination in the Unity review')]
+    items.extend((p['id'], p.get('name') or p['id'], p.get('assetRoot', '')) for p in routing.profiles(S))
+    o = context.active_object
+    if o is not None:
+        current = routing.intent(o, S)[0]
+        if current and current not in {i[0] for i in items}:
+            items.append((current, current + ' (unavailable)', 'This saved destination is no longer in the project profiles; resolve it in Unity'))
+    _destination_items = items
+    return _destination_items
+
+
+class AABRIDGE_OT_import_settings(bpy.types.Operator):
+    bl_idname = 'aa_bridge.import_settings'
+    bl_label = 'Import destination and name'
+    bl_description = 'Choose the purpose folder and intended asset name without changing scene object names or bridge identity'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    destination: bpy.props.EnumProperty(name='Destination', items=_destinations)
+    asset_name: bpy.props.StringProperty(name='Asset name', description='Prefix-free name, e.g. DT_Building_A. Leave blank to keep each selected asset name')
+
+    @classmethod
+    def poll(cls, context):
+        return _session(context) and bool(_import_roots(context))
+
+    def invoke(self, context, event):
+        targets = _import_roots(context)
+        o = context.active_object if context.active_object in targets else targets[0]
+        destination, name = routing.intent(o, session.load() or {})
+        self.destination = destination or '__UNITY_REVIEW__'
+        self.asset_name = name if len(targets) == 1 else ''
+        return context.window_manager.invoke_props_dialog(self, width=520)
+
+    def draw(self, context):
+        S = session.load() or {}
+        targets = _import_roots(context)
+        lay = self.layout
+        lay.prop(self, 'destination')
+        lay.prop(self, 'asset_name')
+        if len(targets) > 1:
+            _lines(lay, f'Applies to {len(targets)} selected asset roots. A blank name keeps each asset name.', 'INFO')
+        if any(routing.asset_key(o) for o in targets):
+            _lines(lay, 'Existing asset files stay in place. Changed preferences are saved for an explicit move and rename in Unity.', 'INFO')
+        if targets:
+            o = context.active_object if context.active_object in targets else targets[0]
+            destination = S.get('defaultDestination', '') if self.destination == '__SCENE_DEFAULT__' else '' if self.destination == '__UNITY_REVIEW__' else self.destination
+            profile = next((p for p in routing.profiles(S) if p['id'] == destination), {})
+            name = routing.normalize_name(self.asset_name or routing.intent(o, S)[1], profile.get('setCode', ''))
+            for line in routing.preview(o, S, (destination, name)):
+                _lines(lay.box(), line)
+
+    def execute(self, context):
+        S = session.load() or {}
+        destination = S.get('defaultDestination', '') if self.destination == '__SCENE_DEFAULT__' else '' if self.destination == '__UNITY_REVIEW__' else self.destination
+        profile = next((p for p in routing.profiles(S) if p['id'] == destination), {})
+        targets = _import_roots(context)
+        for o in targets:
+            # Remember the acknowledged value before introducing an explicit choice on an older session.
+            if 'aa_intent_signature' not in o:
+                o['aa_intent_signature'] = routing.intent_signature(o, S)
+            old_name = routing.intent(o, S, o.instance_collection.name if model.collection_placement(o) and not model.is_instance(o) else None)[1]
+            o['aa_destination'] = destination
+            o['aa_asset_name'] = routing.normalize_name(self.asset_name or old_name, profile.get('setCode', ''))
+        self.report({'INFO'}, f'Import settings saved for {len(targets)} asset root(s). Sync to send them to Unity.')
+        return {'FINISHED'}
+
+
+class AABRIDGE_OT_material_settings(bpy.types.Operator):
+    bl_idname = 'aa_bridge.material_settings'
+    bl_label = 'Material sync settings'
+    bl_description = 'Choose whether Unity or Blender owns materials; texture transfer can be disabled independently'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    material_mode: bpy.props.EnumProperty(name='Materials', items=[
+        ('unity', 'Use Unity materials', 'Keep Unity assignments and material settings; export slot identities only'),
+        ('blender', 'Sync Blender materials', 'Update owned material colours and surface settings from Blender')])
+    sync_textures: bpy.props.BoolProperty(name='Sync textures', default=False,
+        description='Export and update image maps. Off: preserve Unity texture assignments and send colours/scalars only')
+
+    @classmethod
+    def poll(cls, context):
+        return _session(context) and bool(_import_roots(context))
+
+    def invoke(self, context, event):
+        targets = _import_roots(context)
+        o = context.active_object if context.active_object in targets else targets[0]
+        self.material_mode, self.sync_textures = policy.values(o, session.load() or {})
+        return context.window_manager.invoke_props_dialog(self, width=470)
+
+    def draw(self, context):
+        self.layout.prop(self, 'material_mode')
+        row = self.layout.row()
+        row.enabled = self.material_mode == 'blender'
+        row.prop(self, 'sync_textures')
+        _lines(self.layout, 'Use Unity materials preserves material assignments, colours and textures in Unity. '
+               'These choices apply to the shared asset on the next sync.', 'INFO')
+
+    def execute(self, context):
+        S = session.load() or {}
+        for o in _import_roots(context):
+            if 'aa_material_signature' not in o:
+                o['aa_material_signature'] = policy.signature(*policy.values(o, S))
+            o['aa_material_mode'] = self.material_mode
+            o['aa_sync_textures'] = bool(self.sync_textures) if self.material_mode == 'blender' else False
+        self.report({'INFO'}, 'Material sync settings saved. Sync to apply them to Unity.')
+        return {'FINISHED'}
+
+
 class AABRIDGE_OT_set_collider(bpy.types.Operator):
     bl_idname = 'aa_bridge.set_collider'
     bl_label = 'Collider'
@@ -199,6 +318,9 @@ class AABRIDGE_PT_panel(_Panel, bpy.types.Panel):
     def draw(self, context):
         lay = self.layout
         sc = context.scene
+        lay.label(text='Blender Bridge v' + version.current())
+        lay.prop(sc, '["aa_auto_sync_on_save"]', text='Prepare Unity update on Save') if 'aa_auto_sync_on_save' in sc else None
+        _lines(lay, 'Save prepares an update even while Unity is closed.')
         if not _session(context):
             _lines(lay, 'Not a Unity session. Open a scene from Unity: Tools > Blender Bridge > Open in Blender.', 'INFO')
             return
@@ -238,6 +360,16 @@ class AABRIDGE_PT_selection(_Panel, bpy.types.Panel):
                     'group': 'GROUP', 'new': 'MESH_DATA'}.get(kind, 'QUESTION')
             _lines(lay.box(), f'{o.name}: {label}', icon)
         lay.operator('aa_bridge.make_editable', icon='EDITMODE_HLT')
+        if _import_roots(context):
+            lay.operator('aa_bridge.import_settings', icon='FILE_FOLDER')
+            lay.operator('aa_bridge.material_settings', icon='MATERIAL')
+            if o is not None and o in _import_roots(context):
+                mode, textures = policy.values(o, session.load() or {})
+                _lines(lay, 'Use Unity materials' if mode == 'unity' else 'Blender materials, textures ' + ('on' if textures else 'off'))
+                for line in routing.preview(o, session.load() or {}):
+                    _lines(lay.box(), line)
+                if routing.asset_key(o):
+                    _lines(lay, 'Existing files keep their paths until moved in Unity.', 'INFO')
         if _new_roots(context):
             col = lay.column(align=True)
             col.label(text='Collider in Unity')
@@ -270,7 +402,7 @@ class AABRIDGE_PT_help(_Panel, bpy.types.Panel):
             _lines(lay, text, icon)
 
 
-CLASSES = (AABRIDGE_OT_sync, AABRIDGE_OT_make_editable, AABRIDGE_OT_set_collider, AABRIDGE_OT_section_group,
+CLASSES = (AABRIDGE_OT_sync, AABRIDGE_OT_make_editable, AABRIDGE_OT_import_settings, AABRIDGE_OT_material_settings, AABRIDGE_OT_set_collider, AABRIDGE_OT_section_group,
            AABRIDGE_OT_toggle_context, AABRIDGE_PT_panel, AABRIDGE_PT_selection, AABRIDGE_PT_help)
 
 
@@ -290,6 +422,9 @@ def _tick():
 
 
 def register_once():
+    auto_save.register()
+    if bpy.context.scene is not None and bpy.context.scene.get('aa_session_json') and 'aa_auto_sync_on_save' not in bpy.context.scene:
+        bpy.context.scene['aa_auto_sync_on_save'] = True
     for c in CLASSES:
         if not getattr(c, 'is_registered', False):
             bpy.utils.register_class(c)
@@ -298,6 +433,7 @@ def register_once():
 
 
 def unregister():
+    auto_save.unregister()
     if bpy.app.timers.is_registered(_tick):
         bpy.app.timers.unregister(_tick)
     for c in reversed(CLASSES):

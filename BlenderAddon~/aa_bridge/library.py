@@ -148,6 +148,10 @@ def _fill_collection(c, a, meshes, mats):
         c.children.unlink(ch)
     c['aa_kind'] = a['kind']
     c['aa_has_lods'] = int(bool(a.get('hasLods')))
+    c['aa_destination'] = a.get('destination', '')
+    c['aa_asset_name'] = a.get('assetName', '')
+    c['aa_material_mode'] = a.get('materialMode') or 'blender'
+    c['aa_sync_textures'] = bool(a.get('syncTextures', True))
     if a['kind'] == 'blender':
         c['aa_bb_key'] = a['bbKey']
         c['aa_source'] = a['source']
@@ -256,6 +260,11 @@ def build(lib_json):
             _fill_collection(c, a, meshes, mats)
             c['aa_sig'] = sig
             rebuilt += 1
+        # Registry preferences can change without geometry/source hashes changing.
+        c['aa_destination'] = a.get('destination', '')
+        c['aa_asset_name'] = a.get('assetName', '')
+        c['aa_material_mode'] = a.get('materialMode') or 'blender'
+        c['aa_sync_textures'] = bool(a.get('syncTextures', True))
         if c.name != a['name'] and not bpy.data.collections.get(a['name']):
             c.name = a['name']
         if a.get('browsable'):

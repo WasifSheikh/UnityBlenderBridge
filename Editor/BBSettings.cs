@@ -13,7 +13,7 @@ namespace Auleek.BlenderBridge.Editor
     [FilePath("ProjectSettings/BlenderBridge.asset", FilePathAttribute.Location.ProjectFolder)]
     public class BBSettings : ScriptableSingleton<BBSettings>
     {
-        [Serializable] public class SceneRoots { public string sceneGuid; public List<string> rootIds = new List<string>(); }
+        [Serializable] public class SceneRoots { public string sceneGuid; public string defaultDestination = ""; public List<string> rootIds = new List<string>(); }
 
         public List<SceneRoots> scenes = new List<SceneRoots>();
         /// <summary>Prefabs under these folders appear in Blender's Asset Browser.</summary>
@@ -23,6 +23,13 @@ namespace Auleek.BlenderBridge.Editor
         public const string DefaultAssetRoot = "Assets/BlenderBridge/{scene}";
         /// <summary>Where assets modelled in Blender are written; {scene} is replaced by the scene name.</summary>
         public string assetRoot = DefaultAssetRoot;
+        /// <summary>Project-specific art destinations. Empty keeps existing projects compatible; new routed assets
+        /// require a selected profile once profiles have been configured.</summary>
+        public List<BBDestinationProfile> destinationProfiles = new List<BBDestinationProfile>();
+        public string defaultDestination = "";
+        /// <summary>Defaults apply only to new bridge identities; existing assets retain their recorded policy.</summary>
+        public string defaultMaterialMode = "blender";
+        public bool defaultSyncTextures = true;
         public bool autoApply = true;
 
         public void SaveNow() => Save(true);

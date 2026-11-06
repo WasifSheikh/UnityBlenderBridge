@@ -138,6 +138,7 @@ namespace Auleek.BlenderBridge.Editor
         // ================================================================ layout
         void OnGUI()
         {
+            GUILayout.Label("Blender Bridge v" + BBVersion.Current, EditorStyles.miniLabel);
             BBStyles.Init();
             var scene = SceneManager.GetActiveScene();
             if (string.IsNullOrEmpty(scene.path))
@@ -276,6 +277,7 @@ namespace Auleek.BlenderBridge.Editor
                     GUILayout.FlexibleSpace();
                     GUILayout.Label(info.resultTime.ToLocalTime().ToString("HH:mm:ss"), EditorStyles.miniLabel);
                 }
+                DrawAssetRouting();
                 if (plan.error != null) { EditorGUILayout.HelpBox(plan.error, MessageType.Warning); PlanButtons(); return; }
                 GUILayout.Label(plan.Summary(), BBStyles.Hint);
                 if (plan.HasConflicts || plan.HasWarnings)
@@ -303,6 +305,75 @@ namespace Auleek.BlenderBridge.Editor
                 EditorGUILayout.Space(4);
                 PlanButtons();
             }
+        }
+
+        void DrawAssetRouting()
+        {
+            if (plan.result?.assets == null || plan.result.assets.Count == 0) return;
+            GUILayout.Label("Asset import choices", EditorStyles.boldLabel);
+            GUILayout.Label("Choose the art set and the intended name before import. Type prefixes are added once. Existing assets keep their paths; changes to their destination or name are saved as a future migration proposal.", BBStyles.Hint);
+            foreach (var a in plan.result.assets)
+                using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+                {
+                    GUILayout.Label(a.name ?? a.key, EditorStyles.boldLabel);
+                    string destination = DestinationPopup("Destination", a.destination ?? "", "Use scene / project default");
+                    string suggestion = string.IsNullOrEmpty(a.assetName) ? BBRegistry.NormalizeName(a.name ?? a.key) : a.assetName;
+                    string assetName = EditorGUILayout.DelayedTextField("Intended name", suggestion);
+                    plan.routes.TryGetValue(a.key, out var resolved);
+                    var existing = BBRegistry.Get(a.key);
+                    bool existingPolicy = existing != null && !string.IsNullOrEmpty(existing.materialMode);
+                    bool configuredPolicy = !string.IsNullOrEmpty(BBSettings.instance.defaultMaterialMode);
+                    string currentMode = resolved?.materialMode ?? (!string.IsNullOrEmpty(a.materialMode) ? a.materialMode
+                        : existing != null ? existingPolicy ? existing.materialMode : "blender"
+                        : configuredPolicy ? BBSettings.instance.defaultMaterialMode : "blender");
+                    bool currentTextures = resolved?.syncTextures ?? (!string.IsNullOrEmpty(a.materialMode) ? a.syncTextures
+                        : existing != null ? !existingPolicy || existing.syncTextures
+                        : !configuredPolicy || BBSettings.instance.defaultSyncTextures);
+                    if (currentMode == "unity") currentTextures = false;
+                    string materialMode = MaterialModePopup("Materials", currentMode);
+                    bool syncTextures;
+                    using (new EditorGUI.DisabledScope(materialMode == "unity"))
+                        syncTextures = EditorGUILayout.Toggle("Sync textures", materialMode == "unity" ? false : currentTextures);
+                    bool policyChanged = materialMode != currentMode || syncTextures != currentTextures;
+                    if (a.metadataOnly) GUILayout.Label("Preference changes take effect on the next full model sync.", BBStyles.Hint);
+                    if (destination != (a.destination ?? "") || assetName != suggestion || policyChanged)
+                    {
+                        plan.routingOverrides[a.key] = new BBRoutingOverride { destination = destination,
+                            assetName = assetName != suggestion ? assetName : a.assetName ?? "",
+                            materialMode = policyChanged ? materialMode : a.materialMode, syncTextures = policyChanged ? syncTextures : a.syncTextures };
+                        plan = BBPlanner.Build(info.key, plan);
+                        GUIUtility.ExitGUI();
+                    }
+                    if (plan.routes.TryGetValue(a.key, out var route))
+                    {
+                        GUILayout.Label("Prefab: " + route.prefab, BBStyles.Hint);
+                        GUILayout.Label("Source: " + route.source, BBStyles.Hint);
+                    }
+                    if (plan.routingOverrides.ContainsKey(a.key) && GUILayout.Button("Use Blender's choices", EditorStyles.miniButton))
+                    {
+                        plan.routingOverrides.Remove(a.key);
+                        plan = BBPlanner.Build(info.key, plan);
+                        GUIUtility.ExitGUI();
+                    }
+                }
+        }
+
+        static string MaterialModePopup(string label, string value)
+        {
+            int selected = EditorGUILayout.Popup(label, value == "unity" ? 0 : 1,
+                new[] { "Use Unity materials", "Sync Blender materials" });
+            return selected == 0 ? "unity" : "blender";
+        }
+
+        static string DestinationPopup(string label, string value, string emptyLabel)
+        {
+            var profiles = BBSettings.instance.destinationProfiles;
+            var values = new List<string> { "" };
+            var labels = new List<string> { emptyLabel };
+            foreach (var p in profiles) { values.Add(p.id); labels.Add(string.IsNullOrEmpty(p.name) ? p.id : p.name); }
+            if (!values.Contains(value)) { values.Add(value); labels.Add("Missing profile: " + value); }
+            int selected = EditorGUILayout.Popup(label, values.IndexOf(value), labels.ToArray());
+            return values[Mathf.Clamp(selected, 0, values.Count - 1)];
         }
 
         void SetConflicts(bool apply) { foreach (var i in plan.items.Where(i => i.kind == BBKind.Conflict)) i.apply = apply; }
@@ -336,7 +407,7 @@ namespace Auleek.BlenderBridge.Editor
                         GUIUtility.ExitGUI();
                     }
                 if (GUILayout.Button(new GUIContent("Refresh", "Compare again with the scene as it is now"), GUILayout.Width(70), GUILayout.Height(28)))
-                    plan = BBPlanner.Build(info.key);
+                    plan = BBPlanner.Build(info.key, plan);
                 if (GUILayout.Button(new GUIContent("Discard", "Ignore this sync from Blender (Blender keeps its changes and can send them again)"), GUILayout.Width(70), GUILayout.Height(28))
                     && EditorUtility.DisplayDialog("Discard this sync?", "Unity ignores these changes. Blender still has them and sends them again with its next sync.", "Discard", "Cancel"))
                 {
@@ -428,9 +499,24 @@ namespace Auleek.BlenderBridge.Editor
                 if (auto != s.autoApply) { s.autoApply = auto; s.SaveNow(); }
 
                 EditorGUILayout.Space(4);
-                string root = EditorGUILayout.DelayedTextField(new GUIContent("Asset root", "Where assets modelled in Blender are written. {scene} = scene name"), s.assetRoot);
+                GUILayout.Label("New asset defaults", EditorStyles.boldLabel);
+                string shownDefaultMode = string.IsNullOrEmpty(s.defaultMaterialMode) ? "blender" : s.defaultMaterialMode;
+                bool shownDefaultTextures = shownDefaultMode != "unity" && (string.IsNullOrEmpty(s.defaultMaterialMode) || s.defaultSyncTextures);
+                string defaultMode = MaterialModePopup("Materials", shownDefaultMode);
+                bool defaultTextures;
+                using (new EditorGUI.DisabledScope(defaultMode == "unity"))
+                    defaultTextures = EditorGUILayout.Toggle("Sync textures", defaultMode == "unity" ? false : shownDefaultTextures);
+                GUILayout.Label("Existing bridge assets keep their saved material and texture choices.", BBStyles.Hint);
+                if (defaultMode != shownDefaultMode || defaultTextures != shownDefaultTextures)
+                { s.defaultMaterialMode = defaultMode; s.defaultSyncTextures = defaultTextures; RoutingSettingsChanged(s); }
+
+                EditorGUILayout.Space(4);
+                string root = EditorGUILayout.DelayedTextField(new GUIContent("Legacy asset root", "Retained for older sessions. New assets use the art destinations below; existing assets are found by identity."), s.assetRoot);
                 if (root != s.assetRoot) { s.assetRoot = root; s.SaveNow(); }
-                GUILayout.Label("This scene: " + BBPaths.AssetRoot(info?.name ?? "{scene}") + "/Meshes, Materials, Prefabs…", BBStyles.Hint);
+                GUILayout.Label("Older sessions: " + BBPaths.AssetRoot(info?.name ?? "{scene}"), BBStyles.Hint);
+
+                EditorGUILayout.Space(6);
+                DrawDestinations(s);
 
                 EditorGUILayout.Space(6);
                 FolderList("Asset library folders", "Prefabs under these folders appear in Blender's Asset Browser.", s.libraryFolders, true);
@@ -454,6 +540,49 @@ namespace Auleek.BlenderBridge.Editor
                     }
                 }
             }
+        }
+
+        void DrawDestinations(BBSettings s)
+        {
+            GUILayout.Label("Art destinations", EditorStyles.boldLabel);
+            GUILayout.Label("Each destination is a purpose folder (for example Buildings/Downtown), with Meshes, Materials, Textures and Prefabs beneath it. Source folders are relative to the project root, outside Assets, under ArtSource. The bridge does not move existing assets when these settings change.", BBStyles.Hint);
+            EditorGUI.BeginChangeCheck();
+            string projectDefault = DestinationPopup("Project default", s.defaultDestination ?? "", "Choose per asset");
+            string sceneDefault = s.For(info.guid, false)?.defaultDestination ?? "";
+            string nextSceneDefault = DestinationPopup("This scene's default", sceneDefault, "Use project default");
+            if (EditorGUI.EndChangeCheck())
+            {
+                s.defaultDestination = projectDefault;
+                if (nextSceneDefault != sceneDefault) s.For(info.guid, true).defaultDestination = nextSceneDefault;
+                RoutingSettingsChanged(s);
+            }
+            for (int i = 0; i < s.destinationProfiles.Count; i++)
+            {
+                var p = s.destinationProfiles[i];
+                using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+                {
+                    EditorGUI.BeginChangeCheck();
+                    p.name = EditorGUILayout.DelayedTextField("Name", p.name);
+                    p.assetRoot = EditorGUILayout.DelayedTextField("Art folder", p.assetRoot);
+                    p.sourceRoot = EditorGUILayout.DelayedTextField("Source folder", p.sourceRoot);
+                    p.setCode = EditorGUILayout.DelayedTextField("Set code (optional)", p.setCode);
+                    if (EditorGUI.EndChangeCheck()) RoutingSettingsChanged(s);
+                    if (GUILayout.Button("Remove destination", EditorStyles.miniButton))
+                    { s.destinationProfiles.RemoveAt(i); RoutingSettingsChanged(s); GUIUtility.ExitGUI(); }
+                }
+            }
+            if (GUILayout.Button("Add destination", EditorStyles.miniButton))
+            {
+                s.destinationProfiles.Add(new BBDestinationProfile { id = Guid.NewGuid().ToString("N"), name = "Art set", sourceRoot = "ArtSource/" });
+                RoutingSettingsChanged(s);
+                GUIUtility.ExitGUI();
+            }
+        }
+
+        void RoutingSettingsChanged(BBSettings s)
+        {
+            s.SaveNow();
+            if (plan != null) plan = BBPlanner.Build(plan.key, plan);
         }
 
         static void FolderList(string title, string hint, List<string> list, bool folders)

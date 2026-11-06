@@ -19,6 +19,12 @@ namespace Auleek.BlenderBridge.Editor
     }
 
     // ---------------------------------------------------------------- Unity -> Blender
+    [Serializable] public class BBDestinationProfile
+    {
+        public string id = "", name = "", assetRoot = "", sourceRoot = "", setCode = "";
+    }
+    [Serializable] public class BBTextureAlias { public string from, to; }
+
     [Serializable] public class BBLight { public string type = ""; public float[] color; public float intensity, range, spot; }
 
     [Serializable] public class BBNode
@@ -40,6 +46,11 @@ namespace Auleek.BlenderBridge.Editor
         public string sessionId, key, scene, scenePath, sceneGuid, created, library, libraryJson, libraryName, blend, project,
                       assetRoot, outDir, appliedPath, statusPath, tools;
         public List<BBNode> nodes = new List<BBNode>();
+        public List<BBDestinationProfile> profiles = new List<BBDestinationProfile>();
+        public string defaultDestination = "";
+        public string defaultMaterialMode = "blender";
+        public bool defaultSyncTextures = true;
+        public List<BBTextureAlias> textureAliases = new List<BBTextureAlias>();
     }
 
     [Serializable] public class BBPart { public string mesh; public string[] mats; public float[] m; public string path = ""; }
@@ -47,6 +58,9 @@ namespace Auleek.BlenderBridge.Editor
     [Serializable] public class BBAsset
     {
         public string key, name, kind, catalog = "", hash, prefab = "", source = "", sourceCollection = "", bbKey = "";
+        public string destination = "", assetName = "";
+        public string materialMode = "";
+        public bool syncTextures = true;
         public bool browsable, hasLods;
         public List<BBPart> parts = new List<BBPart>();
     }
@@ -82,6 +96,7 @@ namespace Auleek.BlenderBridge.Editor
 
     [Serializable] public class BBOutMaterial
     {
+        public string id = ""; // stable owned material identity; older results use the slot name as an alias
         public string name, unity = "", baseMap = "", normalMap = "", maskMap = "", emissionMap = "", alpha = "opaque";
         public float[] color, emission;
         public float metallic, smoothness = 0.5f, normalScale = 1, cutoff = 0.5f;
@@ -92,6 +107,10 @@ namespace Auleek.BlenderBridge.Editor
     [Serializable] public class BBOutAsset
     {
         public string key, name, fbx, source, sourceCollection, collider = "mesh", hash, dir;
+        public string destination = "", assetName = "";
+        public string materialMode = "";
+        public bool syncTextures = true;
+        public bool metadataOnly;
         public string node = "";   // the Unity object whose geometry this is (Make editable), if any
         public string mode = "";   // prefab instances: "variant" (this instance only) or "source" (the prefab, all copies)
         public string prefab = ""; // "prefab:<guid>" of the original prefab
@@ -112,7 +131,7 @@ namespace Auleek.BlenderBridge.Editor
     }
 
     // ---------------------------------------------------------------- Unity -> Blender, after applying
-    [Serializable] public class BBIdMap { public string tmp, id, asset = "", hash = ""; }
+    [Serializable] public class BBIdMap { public string tmp, id, asset = "", hash = "", destination = "", assetName = "", materialMode = ""; public bool syncTextures = true; }
     [Serializable] public class BBRemap { public string from, to; }
 
     [Serializable] public class BBApplied
@@ -130,7 +149,7 @@ namespace Auleek.BlenderBridge.Editor
         public List<BBImportDone> done = new List<BBImportDone>();
     }
 
-    [Serializable] public class BBImportDone { public string key, finalKey, prefab, model, hash; }
+    [Serializable] public class BBImportDone { public string key, finalKey, prefab, model, hash, routing, prefabGuid, modelGuid; }
 
     /// <summary>Stored in a Blender-made prefab's importer userData: what Blender last wrote into it.</summary>
     [Serializable] public class BBAssetMeta { public string collider = "mesh", parts = ""; }

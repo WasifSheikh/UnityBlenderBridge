@@ -155,27 +155,47 @@ def make_editable(o, mode='variant', cleanup=True):
 
 def relink_project_images():
     """Source .blend files store Unity textures by absolute path, which differs between PCs. Images tagged with their
-    'Assets/...' path are pointed at this machine's project."""
-    project = (load_session() or {}).get('project', '')
+    'Assets/...' path are pointed at this machine's project, following Unity's explicit migration aliases."""
+    session = load_session() or {}
+    project = session.get('project', '')
     if not project:
         return
+    aliases = {}
+    for alias in session.get('textureAliases', []):
+        old, new = M.project_asset_path(alias.get('from')), M.project_asset_path(alias.get('to'))
+        if old and new:
+            aliases[old] = new if old not in aliases or aliases[old] == new else ''
     for img in bpy.data.images:
-        rel = img.get('aa_project_path')
+        rel = M.project_asset_path(img.get('aa_project_path'))
         if not rel or img.packed_file is not None:
             continue
+        original, visited = rel, set()
+        while rel in aliases and rel not in visited and aliases[rel]:
+            visited.add(rel)
+            rel = aliases[rel]
+        if rel in visited:  # Do not guess through an invalid/cyclic alias chain.
+            rel = original
         p = os.path.normpath(os.path.join(project, rel))
-        if os.path.exists(p) and os.path.normcase(os.path.abspath(bpy.path.abspath(img.filepath))) != os.path.normcase(p):
-            img.filepath = p
-            try:
-                img.reload()
-            except Exception:
-                pass
+        if os.path.exists(p):
+            img['aa_project_path'] = rel
+            if os.path.normcase(os.path.abspath(bpy.path.abspath(img.filepath))) != os.path.normcase(p):
+                img.filepath = p
+                try:
+                    img.reload()
+                except Exception:
+                    pass
 
 
 def edit_asset(o):
     """Swap an instance of a Blender-made asset for its editable source objects (same Unity id)."""
+    from . import routing, policy
     c = o.instance_collection
     key, src = c.get('aa_bb_key'), c.get('aa_source')
+    destination, asset_name = routing.intent(o, {})
+    baseline = o.get('aa_intent_signature', routing.signature(c.get('aa_destination', ''),
+                            c.get('aa_asset_name', '') or routing.normalize_name(key)))
+    material_mode, sync_textures = policy.values(o, {})
+    material_baseline = o.get('aa_material_signature', policy.signature(c.get('aa_material_mode', 'blender'), c.get('aa_sync_textures', True)))
     if not src or not os.path.exists(src):
         raise RuntimeError(f'Source file for {key} not found: {src}')
     with bpy.data.libraries.load(src, link=False) as (s, d):
@@ -210,11 +230,16 @@ def edit_asset(o):
     root.name = name
     for k, v in ident.items():
         root[k] = v
-    for k in ('aa_tmp', 'aa_pending_hash'):
+    for k in ('aa_tmp', 'aa_pending_hash', 'aa_pending_intent', 'aa_pending_material_signature'):
         if k in root:
             del root[k]
     root['aa_name'] = root.name
     root['aa_bb_key'] = key
+    # Registry/library preferences take precedence over stale custom properties in an older .blend source.
+    routing.seed(root, destination, asset_name)
+    root['aa_intent_signature'] = baseline
+    policy.seed(root, material_mode, sync_textures)
+    root['aa_material_signature'] = material_baseline
     bpy.context.view_layer.update()
     root['aa_asset_hash'] = X.asset_hash(root)
     X.stamp_base(root)

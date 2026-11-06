@@ -29,6 +29,7 @@ namespace Auleek.BlenderBridge.Editor
             var scene = SceneManager.GetActiveScene();
             if (string.IsNullOrEmpty(scene.path)) return;
             if (scene.path != scenePath) { scenePath = scene.path; key = BBPaths.Key(scene); }
+            if (BBSavedUpdates.Promote(key)) lastSeen = default;
             if (!BBPlanner.HasResult(key, out var t) || t == lastSeen) return;
             lastSeen = t;
             var plan = BBPlanner.Build(key);

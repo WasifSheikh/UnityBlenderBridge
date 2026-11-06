@@ -28,6 +28,8 @@ namespace Auleek.BlenderBridge.Editor
         public string Key => $"{kind}|{id}|{field}";
     }
 
+    public class BBRoutingOverride { public string destination, assetName, materialMode = ""; public bool syncTextures = true; }
+
     public class BBPlan
     {
         public string key, sceneName, error, backupDir;
@@ -35,6 +37,8 @@ namespace Auleek.BlenderBridge.Editor
         public BBResult result;
         public BBLibrary lib;
         public readonly List<BBItem> items = new List<BBItem>();
+        public readonly Dictionary<string, BBRoutingOverride> routingOverrides = new Dictionary<string, BBRoutingOverride>();
+        public readonly Dictionary<string, BBImportRoute> routes = new Dictionary<string, BBImportRoute>();
         internal Dictionary<string, GameObject> live;
         /// <summary>Unity-space matrices of what Blender sent, by node ref (id, or "tmp:..." for new objects).</summary>
         internal readonly Dictionary<string, Matrix4x4> locals = new Dictionary<string, Matrix4x4>(), worlds = new Dictionary<string, Matrix4x4>();
@@ -44,7 +48,8 @@ namespace Auleek.BlenderBridge.Editor
         public bool HasConflicts => items.Any(i => i.kind == BBKind.Conflict);
         public bool HasWarnings => items.Any(i => i.kind == BBKind.Warning);
         public bool IsEmpty => items.All(i => i.kind == BBKind.Warning);
-        public string Fingerprint => string.Join("\n", items.Select(i => i.Key));
+        public string Fingerprint => Hash128.Compute(JsonUtility.ToJson(result)).ToString() + "\n" + string.Join("\n", items.Select(i => i.Key)) + "\n" +
+            string.Join("\n", routes.OrderBy(p => p.Key, StringComparer.Ordinal).Select(p => p.Key + "|" + p.Value.Fingerprint));
 
         public string Summary()
         {
@@ -79,7 +84,7 @@ namespace Auleek.BlenderBridge.Editor
             return e;
         }
 
-        public static BBPlan Build(string key)
+        public static BBPlan Build(string key, BBPlan reviewed = null)
         {
             var plan = new BBPlan { key = key };
             plan.session = BBUtil.Read<BBSession>(BBPaths.SessionJson(key));
@@ -96,6 +101,14 @@ namespace Auleek.BlenderBridge.Editor
             { plan.error = "The last Blender sync was undone in Unity, so the Blender file no longer matches the scene. Open in Blender > Start fresh."; return plan; }
             var scene = SceneManager.GetActiveScene();
             if (scene.path != plan.session.scenePath) { plan.error = $"Open {plan.session.scenePath} to apply its Blender changes."; return plan; }
+
+            // Review choices belong to this particular result, never a later sync from Blender. Keep the on-disk
+            // result immutable so Apply can revalidate it and a new session cannot inherit an old choice.
+            if (reviewed?.result != null && reviewed.result.sessionId == plan.result.sessionId && reviewed.result.written == plan.result.written)
+                foreach (var p in reviewed.routingOverrides)
+                    plan.routingOverrides[p.Key] = new BBRoutingOverride { destination = p.Value.destination, assetName = p.Value.assetName,
+                        materialMode = p.Value.materialMode, syncTextures = p.Value.syncTextures };
+            if (!ResolveRoutes(plan)) return plan;
 
             var live = plan.live = BBUtil.SceneIndex(scene);
             var idOf = new Dictionary<GameObject, string>(live.Count);
@@ -198,6 +211,43 @@ namespace Auleek.BlenderBridge.Editor
             return plan;
         }
 
+        static bool ResolveRoutes(BBPlan plan)
+        {
+            var paths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var errors = new List<string>();
+            foreach (var a in plan.result.assets)
+            {
+                if (plan.routingOverrides.TryGetValue(a.key, out var choice))
+                { a.destination = choice.destination; a.assetName = choice.assetName; a.materialMode = choice.materialMode; a.syncTextures = choice.syncTextures; }
+                try
+                {
+                    if (plan.routes.ContainsKey(a.key)) throw new InvalidOperationException("The result contains this asset key more than once.");
+                    var route = BBRegistry.Resolve(a, plan.session);
+                    foreach (var path in new[] { route.model, route.prefab, route.source }.Where(p => !string.IsNullOrEmpty(p)))
+                    {
+                        if (paths.TryGetValue(path, out var other) && other != a.key)
+                            throw new InvalidOperationException($"Destination collides with {other}: {path}");
+                        paths[path] = a.key;
+                    }
+                    plan.routes[a.key] = route;
+                    var record = route.record;
+                    if (record != null && ((!string.IsNullOrEmpty(a.destination) && a.destination != record.destination) ||
+                                           (!string.IsNullOrEmpty(a.assetName) && a.assetName != record.assetName)))
+                        plan.items.Add(new BBItem { kind = BBKind.Warning, phase = BBPhase.Info, id = a.key, field = "routing",
+                            text = $"{a.name}: destination/name change is a future migration proposal. Existing files stay at their current paths." });
+                }
+                catch (Exception e)
+                {
+                    string text = $"{a.name ?? a.key}: {e.Message}";
+                    errors.Add(text);
+                    plan.items.Add(new BBItem { kind = BBKind.Warning, phase = BBPhase.Info, id = a.key, field = "routing", text = text });
+                }
+            }
+            if (errors.Count == 0) return true;
+            plan.error = "Choose a valid destination and intended name for each asset before applying. " + string.Join("\n", errors);
+            return false;
+        }
+
         static void AddAssets(BBPlan plan, Dictionary<string, GameObject> live, Dictionary<string, BBNode> snap)
         {
             foreach (var a in plan.result.assets)
@@ -218,6 +268,9 @@ namespace Auleek.BlenderBridge.Editor
                     text = a.isNew ? $"New prefab variant PF_{a.key} of {original} with the Blender geometry" : $"Prefab variant PF_{a.key} updated";
                 else
                     text = a.isNew ? $"New Blender asset {a.name}: model, {a.materials.Count} material(s), prefab" : $"Blender asset {a.name} updated (model, materials)";
+                if (plan.routes.TryGetValue(a.key, out var route))
+                    text = a.metadataOnly ? $"{a.name}: save import preferences for the next full model sync; existing asset files stay put"
+                        : text + $" → {route.prefab} ({(route.materialMode == "unity" ? "Unity materials; skip textures" : route.syncTextures ? "Blender materials and textures" : "Blender materials; skip texture sync")})";
                 if (a.isNew && (a.mode == "source" || a.mode == "variant"))
                 {
                     var pf = AssetDatabase.LoadAssetAtPath<GameObject>(originalPath);

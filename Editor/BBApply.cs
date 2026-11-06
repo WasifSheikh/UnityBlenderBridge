@@ -20,6 +20,7 @@ namespace Auleek.BlenderBridge.Editor
 
         public static bool Apply(BBPlan preview, bool interactive)
         {
+            if (preview.error != null) return false;
             var scene = SceneManager.GetActiveScene();
             if (preview.session == null || scene.path != preview.session.scenePath) { preview.error = "the scene the changes are for is not open"; return false; }
             if (scene.isDirty)
@@ -27,7 +28,7 @@ namespace Auleek.BlenderBridge.Editor
                 if (!interactive) { preview.error = "the scene has unsaved changes"; return false; }
                 if (!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo() || scene.isDirty) { preview.error = "save the scene first, so the backup holds everything"; return false; }
             }
-            var plan = BBPlanner.Build(preview.key);
+            var plan = BBPlanner.Build(preview.key, preview);
             if (plan.error != null) { preview.error = plan.error; return false; }
             if (plan.Fingerprint != preview.Fingerprint) { preview.error = "the scene or Blender's changes moved on since the preview; preview again"; return false; }
             var choices = preview.items.GroupBy(i => i.Key).ToDictionary(g => g.Key, g => g.First().apply);
@@ -92,10 +93,14 @@ namespace Auleek.BlenderBridge.Editor
             for (int i = 0; i < items.Count; i++)
             {
                 var asset = plan.result.assets.First(x => x.key == items[i].id);
-                var prev = progress.done.FirstOrDefault(d => d.key == asset.key && d.hash == asset.hash);
-                if (prev != null && AssetDatabase.LoadAssetAtPath<GameObject>(prev.prefab))
+                string routing = plan.routes[asset.key].Fingerprint;
+                var prev = progress.done.FirstOrDefault(d => d.key == asset.key && d.hash == asset.hash && d.routing == routing);
+                string prefabPath = prev == null ? "" : string.IsNullOrEmpty(prev.prefabGuid) ? prev.prefab : AssetDatabase.GUIDToAssetPath(prev.prefabGuid);
+                string modelPath = prev == null ? "" : string.IsNullOrEmpty(prev.modelGuid) ? prev.model : AssetDatabase.GUIDToAssetPath(prev.modelGuid);
+                if (prev != null && AssetDatabase.LoadAssetAtPath<GameObject>(prefabPath) &&
+                    (string.IsNullOrEmpty(prev.model) || AssetDatabase.LoadAssetAtPath<GameObject>(modelPath)))
                 {
-                    BBSceneOps.Record(ctx, prev.key, prev.finalKey, prev.prefab, prev.model);
+                    BBSceneOps.Record(ctx, prev.key, prev.finalKey, prefabPath, modelPath);
                     reused++;
                     continue;
                 }
@@ -106,7 +111,9 @@ namespace Auleek.BlenderBridge.Editor
                     string finalKey = ctx.Final(asset.key);
                     ctx.assetPrefabs.TryGetValue(finalKey, out var pf);
                     ctx.assetModels.TryGetValue(finalKey, out var md);
-                    progress.done.Add(new BBImportDone { key = asset.key, finalKey = finalKey, prefab = pf, model = md, hash = asset.hash });
+                    progress.done.RemoveAll(d => d.key == asset.key);
+                    progress.done.Add(new BBImportDone { key = asset.key, finalKey = finalKey, prefab = pf, model = md, hash = asset.hash, routing = routing,
+                        prefabGuid = string.IsNullOrEmpty(pf) ? "" : AssetDatabase.AssetPathToGUID(pf), modelGuid = string.IsNullOrEmpty(md) ? "" : AssetDatabase.AssetPathToGUID(md) });
                     BBUtil.Write(path, BBUtil.Json(progress));
                 }
                 catch (Exception e)
@@ -167,16 +174,24 @@ namespace Auleek.BlenderBridge.Editor
                 keep.Add(new BBNode { id = id, name = c.go.name, parent = Map(c.node.parent), asset = c.asset, kind = c.kind, editable = true, active = c.go.activeInHierarchy, m = c.node.m });
                 string bbKey = c.node.asset.StartsWith("blender:") ? ctx.Final(c.node.asset.Substring(8)) : "";  // new model placed
                 var oa = bbKey != "" ? plan.result.assets.FirstOrDefault(a => a.key == c.node.asset.Substring(8)) : null;
-                applied.ids.Add(new BBIdMap { tmp = c.node.tmp, id = id, asset = bbKey, hash = oa?.hash ?? "" });
+                applied.ids.Add(Ack(c.node.tmp, id, bbKey, oa));
             }
             foreach (var a in plan.result.assets.Where(a => !a.isNew))
-                applied.ids.Add(new BBIdMap { tmp = "", id = "", asset = ctx.Final(a.key), hash = a.hash });
+                applied.ids.Add(Ack("", "", ctx.Final(a.key), a));
             foreach (var a in plan.result.assets.Where(a => a.isNew && !string.IsNullOrEmpty(a.node)))
-                applied.ids.Add(new BBIdMap { tmp = "", id = Map(a.node), asset = ctx.Final(a.key), hash = a.hash });
+                applied.ids.Add(Ack("", Map(a.node), ctx.Final(a.key), a));
             applied.remap = remap.Select(kv => new BBRemap { from = kv.Key, to = kv.Value }).ToList();
             plan.session.nodes = keep;
             BBUtil.Write(BBPaths.SessionJson(plan.key), BBUtil.Json(plan.session));
             return applied;
+        }
+
+        static BBIdMap Ack(string tmp, string id, string key, BBOutAsset a)
+        {
+            var record = string.IsNullOrEmpty(key) ? null : BBRegistry.Get(key);
+            return new BBIdMap { tmp = tmp, id = id, asset = key, hash = a?.hash ?? "",
+                destination = record?.destination ?? a?.destination ?? "", assetName = record?.assetName ?? a?.assetName ?? "",
+                materialMode = record?.materialMode ?? a?.materialMode ?? "", syncTextures = record?.syncTextures ?? a?.syncTextures ?? true };
         }
 
         public static void WriteStatus(string key, string sessionId, string state, string message) =>

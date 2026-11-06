@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- Shared release version in the Unity window and Blender sidebar; package.json is authoritative.
+- Saving a bridge session prepares an immutable update for Unity, including while Unity is closed.
+- Unity discovers the latest saved update when its scene opens; stale snapshots are retained for recovery rather than applied over newer state.
+- Added per-update patch-bump policy. Includes the local GUID registry, purpose destinations and material/texture ownership controls.
+
+
 ## 0.2.0
 
 Blender files made with 0.1.0 can't be continued: open each scene once with **Start fresh**.

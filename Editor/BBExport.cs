@@ -57,7 +57,15 @@ namespace Auleek.BlenderBridge.Editor
                 created = DateTime.Now.ToString("s"), library = BBPaths.LibraryBlend, libraryJson = BBPaths.LibraryJson, libraryName = BBPaths.LibraryName,
                 blend = BBPaths.Blend(key), project = BBPaths.Project, assetRoot = BBPaths.AssetRoot(scene.name), outDir = BBPaths.OutDir(key),
                 appliedPath = BBPaths.AppliedJson(key), statusPath = BBPaths.StatusJson(key), tools = BBPaths.Tools,
+                profiles = BBSettings.instance.destinationProfiles.Select(p => new BBDestinationProfile
+                    { id = p.id, name = p.name, assetRoot = p.assetRoot, sourceRoot = p.sourceRoot, setCode = p.setCode }).ToList(),
+                defaultDestination = BBSettings.instance.For(AssetDatabase.AssetPathToGUID(scene.path), false)?.defaultDestination ?? "",
+                defaultMaterialMode = string.IsNullOrEmpty(BBSettings.instance.defaultMaterialMode) ? "blender" : BBSettings.instance.defaultMaterialMode,
+                defaultSyncTextures = BBSettings.instance.defaultMaterialMode != "unity" &&
+                    (string.IsNullOrEmpty(BBSettings.instance.defaultMaterialMode) || BBSettings.instance.defaultSyncTextures),
+                textureAliases = BBRegistry.TextureAliases(),
             };
+            if (string.IsNullOrEmpty(session.defaultDestination)) session.defaultDestination = BBSettings.instance.defaultDestination;
             lib = new BBLibrary { blend = BBPaths.LibraryBlend, dir = BBPaths.LibraryDir, libraryName = BBPaths.LibraryName };
             reader = new BBMaterialReader(warnings);
             Directory.CreateDirectory(BBPaths.MeshCache);
@@ -240,11 +248,19 @@ namespace Auleek.BlenderBridge.Editor
             bool hasSrc = !string.IsNullOrEmpty(src) && File.Exists(src);
             string hash = AssetDatabase.GetAssetDependencyHash(path).ToString();
             if (bbk != null) hash += "|" + Hash128.Compute(AssetImporter.GetAtPath(path)?.userData ?? "") + (hasSrc ? "|" + File.GetLastWriteTimeUtc(src).Ticks : "");
-            if (TryReuse(key, hash, browsable, hasSrc ? "Blender made" : catalog)) return key;
+            if (TryReuse(key, hash, browsable, hasSrc ? "Blender made" : catalog))
+            {
+                var cached = assets[key];
+                cached.prefab = path;
+                if (hasSrc && cached.kind == "blender") cached.source = src;
+                Routing(cached, bbk);
+                return key;
+            }
 
             var root = AssetDatabase.LoadAssetAtPath<GameObject>(path);
             if (!root) return null;
             var a = new BBAsset { key = key, name = UniqueName(root.name), kind = "prefab", catalog = catalog, prefab = path, browsable = browsable, hash = hash };
+            Routing(a, bbk);
             assets[key] = a;
 
             if (hasSrc)
@@ -267,6 +283,15 @@ namespace Auleek.BlenderBridge.Editor
             foreach (var p in parts)
                 a.parts.Add(new BBPart { mesh = MeshKey(p.mesh), mats = p.materials.Select(MatKey).ToArray(), m = BBConvert.Flat(p.blenderMatrix), path = p.path });
             return key;
+        }
+
+        static void Routing(BBAsset a, string bbKey)
+        {
+            var record = string.IsNullOrEmpty(bbKey) ? null : BBRegistry.Get(bbKey);
+            a.destination = record?.destination ?? "";
+            a.assetName = record?.assetName ?? (string.IsNullOrEmpty(bbKey) ? "" : BBRegistry.NormalizeName(bbKey));
+            a.materialMode = record == null ? "" : string.IsNullOrEmpty(record.materialMode) ? "blender" : record.materialMode;
+            a.syncTextures = a.materialMode != "unity" && (record == null || string.IsNullOrEmpty(record.materialMode) || record.syncTextures);
         }
 
         string MeshAsset(UMesh mesh, Material[] materials, string name)

@@ -11,6 +11,7 @@ import bpy
 
 from .common import CONTEXT, EDIT, mat, read_json, srgb_to_linear
 from .library import INDEX
+from . import routing, policy
 
 
 def session_path():
@@ -69,6 +70,7 @@ def build(path):
     bpy.ops.wm.read_homefile(use_empty=True)
     scene = bpy.context.scene
     scene.name = S['scene']
+    scene['aa_auto_sync_on_save'] = True
     scene['aa_session'] = S['sessionId']
     scene['aa_session_json'] = path
     scene['aa_tools'] = S.get('tools') or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -105,6 +107,9 @@ def build(path):
                     o.instance_type = 'COLLECTION'
                     o.instance_collection = c
                     o.empty_display_size = 0.1
+                    if c.get('aa_bb_key'):
+                        routing.seed(o, *routing.intent(o, S))
+                        policy.seed(o, *policy.values(o, S))
                 else:
                     missing += 1
                     o.empty_display_type = 'CUBE'

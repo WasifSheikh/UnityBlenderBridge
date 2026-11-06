@@ -23,7 +23,7 @@ namespace Auleek.BlenderBridge.Editor
 
         /// <summary>PF_key: a variant of the model, static, with the collider Blender asked for. previousCollider is what
         /// the last sync set up, so switching e.g. mesh -> box removes the mesh colliders it added.</summary>
-        public static void BuildModelPrefab(string model, string prefabPath, string name, BBOutAsset a, string previousCollider)
+        public static void BuildModelPrefab(string model, string prefabPath, string name, BBOutAsset a, string previousCollider, Dictionary<string, Material[]> preservedMaterials = null)
         {
             if (!System.IO.File.Exists(BBPaths.Full(prefabPath)))
             {
@@ -33,6 +33,7 @@ namespace Auleek.BlenderBridge.Editor
                     inst.name = name;
                     FixPartTransforms(inst, a);
                     Setup(inst, a.collider, "none");
+                    RestoreMaterials(inst, preservedMaterials);
                     PrefabUtility.SaveAsPrefabAsset(inst, prefabPath);
                 }
                 finally { Object.DestroyImmediate(inst); }
@@ -43,6 +44,7 @@ namespace Auleek.BlenderBridge.Editor
             {
                 FixPartTransforms(c, a);
                 Setup(c, a.collider, previousCollider);
+                RestoreMaterials(c, preservedMaterials);
                 PrefabUtility.SaveAsPrefabAsset(c, prefabPath);
             }
             finally { PrefabUtility.UnloadPrefabContents(c); }
@@ -52,7 +54,7 @@ namespace Auleek.BlenderBridge.Editor
         /// mesh, materials and position; new objects become new parts (static and with a collider when the prefab's
         /// parts have them); parts deleted in Blender are switched off; LOD groups keep only the edited LOD0. Everything
         /// else in the prefab (components, other children) is untouched.</summary>
-        public static void ApplyParts(string prefabPath, string model, BBOutAsset a, List<string> log)
+        public static void ApplyParts(string prefabPath, string model, BBOutAsset a, List<string> log, bool keepUnityMaterials = false, Dictionary<string, Material[]> preservedMaterials = null)
         {
             var contents = PrefabUtility.LoadPrefabContents(prefabPath);
             try
@@ -89,7 +91,7 @@ namespace Auleek.BlenderBridge.Editor
                     var old = mf.sharedMesh;
                     mf.sharedMesh = src.sharedMesh;
                     mr.enabled = true;
-                    mr.sharedMaterials = src.GetComponent<MeshRenderer>().sharedMaterials;
+                    if (!keepUnityMaterials || added) mr.sharedMaterials = src.GetComponent<MeshRenderer>().sharedMaterials;
                     foreach (var mc in target.GetComponents<MeshCollider>())
                         if (!mc.sharedMesh || mc.sharedMesh == old) mc.sharedMesh = src.sharedMesh;
                     if (added && collidersInPrefab) target.gameObject.AddComponent<MeshCollider>().sharedMesh = src.sharedMesh;
@@ -103,9 +105,35 @@ namespace Auleek.BlenderBridge.Editor
                     foreach (var mc in t.GetComponents<MeshCollider>()) mc.enabled = false;
                 }
                 CollapseLods(contents, changed, a, log);
+                RestoreMaterials(contents, preservedMaterials);
                 PrefabUtility.SaveAsPrefabAsset(contents, prefabPath);
             }
             finally { PrefabUtility.UnloadPrefabContents(contents); }
+        }
+
+        public static Dictionary<string, Material[]> CaptureMaterials(string prefabPath)
+        {
+            var root = AssetDatabase.LoadAssetAtPath<GameObject>(prefabPath);
+            return !root ? null : root.GetComponentsInChildren<Renderer>(true)
+                .GroupBy(r => AnimationUtility.CalculateTransformPath(r.transform, root.transform))
+                .ToDictionary(g => g.Key, g => g.First().sharedMaterials);
+        }
+
+        static void RestoreMaterials(GameObject root, Dictionary<string, Material[]> materials)
+        {
+            if (materials == null) return;
+            foreach (var kv in materials)
+            {
+                var target = kv.Key == "" ? root.transform : root.transform.Find(kv.Key);
+                if (!target || !target.TryGetComponent<Renderer>(out var renderer)) continue;
+                var mesh = renderer is SkinnedMeshRenderer skin ? skin.sharedMesh : target.GetComponent<MeshFilter>()?.sharedMesh;
+                int count = mesh ? mesh.subMeshCount : kv.Value.Length;
+                var current = renderer.sharedMaterials;
+                var restored = new Material[count];
+                for (int i = 0; i < count; i++) restored[i] = i < kv.Value.Length ? kv.Value[i]
+                    : i < current.Length && current[i] ? current[i] : BBMaterialWriter.UnityDefaultMaterial();
+                renderer.sharedMaterials = restored;
+            }
         }
 
         /// <summary>A LOD group whose LOD0 was remodelled would still switch to the old LOD1+ meshes at distance: it keeps

@@ -1,3 +1,5 @@
+import os
+os.environ['AA_BRIDGE_DISABLE_AUTO_SAVE'] = '1'
 """Headless test of the Blender side of the bridge, with fake Unity data (no Unity needed).
 
     blender -b --factory-startup --python Tests~/test_blender_side.py
@@ -16,6 +18,7 @@ import struct
 import sys
 import tempfile
 import traceback
+import uuid
 
 import bpy
 
@@ -24,7 +27,7 @@ TOOLS = os.path.join(os.path.dirname(HERE), 'BlenderAddon~')
 sys.dont_write_bytecode = True
 sys.path.insert(0, TOOLS)
 
-from aa_bridge import editable, export, library, model, session, sync, ui  # noqa: E402
+from aa_bridge import editable, export, library, materials, model, routing, policy, session, sync, ui  # noqa: E402
 from aa_bridge.common import read_json, write_json  # noqa: E402
 
 CHECKS = []
@@ -188,6 +191,11 @@ def unity_applies(S, R, remap=None, keys=None):
             ids.append({'tmp': '', 'id': '', 'asset': a['key'], 'hash': a['hash']})
         elif a['node']:
             ids.append({'tmp': '', 'id': (remap or {}).get(a['node'], a['node']), 'asset': keys.get(a['key'], a['key']), 'hash': a['hash']})
+    for entry in ids:
+        a = next((a for a in R['assets'] if keys.get(a['key'], a['key']) == entry.get('asset')), None)
+        if a is not None:
+            entry.update(destination=a.get('destination', ''), assetName=a.get('assetName', ''),
+                         materialMode=a.get('materialMode', 'blender'), syncTextures=a.get('syncTextures', True))
     write_json(S['appliedPath'], {'sessionId': S['sessionId'], 'applied': '2026-11-04T12:30:00', 'summary': 'test',
                                   'ids': ids, 'remap': [{'from': k, 'to': v} for k, v in (remap or {}).items()]})
     os.replace(os.path.join(S['outDir'], 'result.json'), os.path.join(S['outDir'], 'result.applied.json'))
@@ -357,9 +365,163 @@ def run(root):
     check(r.get('aa_bb_key') == 'NewCrate_2' and r.get('aa_id') == 'U:placed' and r.type == 'MESH', 'Blender-made asset reopened from its source')
     check(export.fbx_name(r) == 'NewCrate', f'reopened asset keeps its export name ({export.fbx_name(r)})')
     check(len(r.data.materials) == 2, 'source keeps its materials')
+    saved_material_ids = {m['id'] for m in newc['materials'] if m.get('id')}
+    reopened_material_ids = {m.get('aa_bb_material_id') for m in r.data.materials if not m.get('aa_key')}
+    check(bool(saved_material_ids) and saved_material_ids == reopened_material_ids, 'owned material ids persist in the editable source')
     sync.sync_to_unity()
     check(result(S)['assets'] == [], 'reopened, unchanged asset is not re-exported')
     os.remove(os.path.join(S['outDir'], 'result.json'))
+
+    # ---- purpose profiles and name-only preferences never rewrite an existing model
+    S['profiles'] = [
+        {'id': 'buildings', 'name': 'Buildings', 'assetRoot': 'Assets/Art/Environment/Buildings/Downtown',
+         'sourceRoot': 'ArtSource/Environment/Buildings/Downtown', 'setCode': 'DT'},
+        {'id': 'props', 'name': 'Props', 'assetRoot': 'Assets/Art/Environment/Props/Street',
+         'sourceRoot': 'ArtSource/Environment/Props/Street', 'setCode': ''}]
+    S['defaultDestination'] = 'buildings'
+    write_json(sjson, S)
+    check(routing.normalize_name('SM_SM_Building_A_baked.001', 'DT') == 'DT_Building_A_Baked',
+          'filename stem removes duplicate prefixes and Blender suffix, keeps meaningful words')
+    check(routing.normalize_name('PF_DT_Lamp_1', 'DT') == 'DT_Lamp_01', 'set code is not duplicated and numeric variants are padded')
+    before_key, before_fbx = r['aa_bb_key'], export.fbx_name(r)
+    r['aa_destination'], r['aa_asset_name'] = 'buildings', 'Building_A_baked'
+    sync.sync_to_unity()
+    RM = result(S)
+    check(len(RM['assets']) == 1 and RM['assets'][0].get('metadataOnly') and not RM['assets'][0].get('node')
+          and 'fbx' not in RM['assets'][0], 'routing-only change sends preferences without model export or scene retarget')
+    check(RM['assets'][0]['assetName'] == 'DT_Building_A_Baked' and RM['assets'][0]['key'] == before_key,
+          'routing-only request keeps the original bridge key')
+    unity_applies(S, RM)
+    sync.stamp_applied()
+    check(not routing.dirty(r, S) and r['aa_bb_key'] == before_key and export.fbx_name(r) == before_fbx,
+          'metadata acknowledgement clears dirty state while key and FBX node name stay stable')
+    sync.sync_to_unity()
+    check(result(S)['assets'] == [], 'acknowledged preference does not trigger a followup export')
+    os.remove(os.path.join(S['outDir'], 'result.json'))
+
+    # ---- identical visible geometry shares only when explicit import intent agrees
+    samples = [new_mesh(name, 4.7) for name in ('DestOne', 'DestTwo', 'NameOther', 'AutoCopyA', 'AutoCopyB')]
+    samples[0]['aa_destination'], samples[0]['aa_asset_name'] = 'buildings', 'Shared'
+    samples[1]['aa_destination'], samples[1]['aa_asset_name'] = 'props', 'Shared'
+    samples[2]['aa_destination'], samples[2]['aa_asset_name'] = 'buildings', 'Other'
+    check(routing.intent(samples[3], S) == ('buildings', 'DT_AutoCopyA'), 'new model uses the scene destination and set code by default')
+    check(routing.preview(samples[3], S) == [
+        'Assets/Art/Environment/Buildings/Downtown/Meshes/SM_DT_AutoCopyA.fbx',
+        'Assets/Art/Environment/Buildings/Downtown/Prefabs/PF_DT_AutoCopyA.prefab',
+        'ArtSource/Environment/Buildings/Downtown/DT_AutoCopyA.blend'], 'destination preview includes purpose folders, readable names and ArtSource')
+    sync.sync_to_unity()
+    RI = result(S)
+    check(len(RI['assets']) == 4, 'explicitly different names and destinations do not silently deduplicate')
+    placed = {n['name']: n['asset'] for n in RI['added']}
+    check(placed['AutoCopyA'] == placed['AutoCopyB'] and len({placed[n] for n in ('DestOne', 'DestTwo', 'NameOther', 'AutoCopyA')}) == 4,
+          'automatic copies still share geometry while explicit intents stay separate')
+    check(all(uuid.UUID(a['key']).hex == a['key'] for a in RI['assets']), 'new asset identity is a UUID independent of visible name')
+    owned = next(m for m in r.data.materials if not m.get('aa_key'))
+    material_id = owned['aa_bb_material_id']
+    owned.name = 'Renamed_Material'
+    check(materials.describe(owned, materials.Fingerprint(proj))['id'] == material_id, 'renaming an owned material preserves its stable identity')
+    unity_applies(S, RI)
+    sync.stamp_applied()
+
+    linked_path = os.path.join(root, 'LinkedMaterials.blend')
+    external = bpy.data.materials.new('ExternalSurface')
+    bpy.data.libraries.write(linked_path, {external})
+    with bpy.data.libraries.load(linked_path, link=True) as (_, target):
+        target.materials = ['ExternalSurface']
+    linked = target.materials[0]
+    linked_id = materials.describe(linked, materials.Fingerprint(proj))['id']
+    check(linked.library is not None and not linked.get('aa_bb_material_id')
+          and linked_id == materials.describe(linked, materials.Fingerprint(proj))['id'],
+          'read-only linked materials get a stable identity without editing the external library')
+
+    # ---- a moved project texture keeps Unity identity instead of exporting stale Blender pixels
+    missing = bpy.data.images.new('MovedUnityTexture', width=2, height=2)
+    missing.filepath = os.path.join(proj, 'Assets', 'Textures', 'OldSurface.png')
+    missing['aa_project_path'] = 'Assets/Textures/OldSurface.png'
+    image_output = os.path.join(root, 'ShouldNotExportStalePixels')
+    check(materials.Images(image_output, proj).save(missing) == 'asset:Assets/Textures/OldSurface.png'
+          and not os.path.exists(image_output), 'missing project texture stays an asset reference without writing cached pixels')
+    missing['aa_project_path'] = 'Assets/../../Outside.png'
+    check(materials.project_asset(missing, proj) == ''
+          and not materials.project_asset_path('C:/Assets/Outside.png')
+          and not materials.project_asset_path('Assets\\..\\Outside.png'), 'project texture markers reject traversal and absolute paths')
+    missing['aa_project_path'] = 'Assets/Textures/OldSurface.png'
+    relocated = os.path.join(proj, 'Assets', 'Textures', 'RelocatedSurface.png')
+    save_png(relocated, (0.2, 0.4, 0.6, 1.0))
+    S['textureAliases'] = [{'from': 'Assets/Textures/OldSurface.png', 'to': 'Assets/Textures/RelocatedSurface.png'}]
+    write_json(sjson, S)
+    editable.relink_project_images()
+    check(missing.get('aa_project_path') == 'Assets/Textures/RelocatedSurface.png'
+          and os.path.normcase(os.path.normpath(missing.filepath)) == os.path.normcase(os.path.normpath(relocated))
+          and materials.project_asset(missing, proj) == 'Assets/Textures/RelocatedSurface.png',
+          'source image follows session migration aliases to the current Unity texture')
+
+    # ---- material ownership and texture transfer are independent of routing and unchanged geometry
+    sync.sync_to_unity()  # acknowledge the material rename used by the identity check above
+    unity_applies(S, result(S))
+    sync.stamp_applied()
+    S['defaultMaterialMode'], S['defaultSyncTextures'] = 'unity', False
+    write_json(sjson, S)
+    check(policy.values(r, S) == ('blender', True), 'new material defaults do not silently change an existing legacy asset')
+    unity_model = new_mesh('UnityOwnedModel', 6.2, mat=owned)
+    check(policy.values(unity_model, S) == ('unity', False), 'new models default to Unity materials with no texture transfer')
+    save_image, mask_image = materials.Images.save, materials.Images.mask
+    def forbid_texture(*args, **kwargs):
+        raise AssertionError('Texture transfer was called while disabled')
+    materials.Images.save = materials.Images.mask = forbid_texture
+    try:
+        sync.sync_to_unity()
+        RU = result(S)
+        ua = next(a for a in RU['assets'] if a['name'] == 'UnityOwnedModel')
+        check(ua['materialMode'] == 'unity' and not ua['syncTextures']
+              and all(set(m) <= {'name', 'id', 'unity'} for m in ua['materials'])
+              and not os.path.exists(os.path.join(ua['dir'], 'Textures')), 'Unity material mode exports slot identities only and no texture files')
+        unity_applies(S, RU)
+        sync.stamp_applied()
+        before_hash, before_key = export.asset_hash(unity_model), unity_model['aa_bb_key']
+        unity_model['aa_material_mode'], unity_model['aa_sync_textures'] = 'blender', False
+        sync.sync_to_unity()
+        RP = result(S)
+        pa = next(a for a in RP['assets'] if a['key'] == before_key)
+        check(not pa.get('metadataOnly') and pa.get('fbx') and export.asset_hash(unity_model) == before_hash,
+              'policy-only change forces a real asset export without changing geometry identity')
+        check(pa['materialMode'] == 'blender' and not pa['syncTextures']
+              and all(not m.get(field) for m in pa['materials'] for field in ('baseMap', 'normalMap', 'maskMap', 'emissionMap'))
+              and any('color' in m for m in pa['materials']) and not os.path.exists(os.path.join(pa['dir'], 'Textures')),
+              'Blender material mode with textures off sends colours/scalars without image conversion or texture files')
+        policy_source = os.path.join(root, 'PolicySource.blend')
+        shutil.copy2(os.path.join(pa['dir'], pa['source']), policy_source)
+        unity_applies(S, RP)
+        sync.stamp_applied()
+        check(not policy.dirty(unity_model, S), 'material-policy acknowledgement clears policy dirty state')
+        sync.sync_to_unity()
+        check(result(S)['assets'] == [], 'unchanged policy after acknowledgement sends no duplicate model')
+        os.remove(os.path.join(S['outDir'], 'result.json'))
+        pc = bpy.data.collections.new('PolicyLinkedLibrary')
+        pc['aa_key'], pc['aa_bb_key'], pc['aa_kind'] = 'prefab:policy', before_key, 'blender'
+        pc['aa_source'], pc['aa_destination'], pc['aa_asset_name'] = policy_source, unity_model['aa_destination'], unity_model['aa_asset_name']
+        pc['aa_material_mode'], pc['aa_sync_textures'] = 'blender', False
+        with bpy.data.libraries.load(policy_source, link=True) as (_, target):
+            target.collections = ['AA_Asset']
+        pc.children.link(target.collections[0])
+        pi = bpy.data.objects.new('PolicyInstance', None)
+        pi.instance_type, pi.instance_collection = 'COLLECTION', pc
+        pi['aa_id'] = 'U:policy-instance'
+        sc.collection.objects.link(pi)
+        policy.seed(pi, 'blender', False)
+        pi['aa_material_mode'] = 'unity'
+        sync.sync_to_unity()
+        RPI = result(S)
+        pia = next(a for a in RPI['assets'] if a['key'] == before_key)
+        check(not pia.get('metadataOnly') and pia['materialMode'] == 'unity' and not pia.get('node'),
+              'policy change on linked Blender asset exports source geometry without retargeting the scene instance')
+        check(sorted(p['object'] for p in pia['parts']) == sorted(p['object'] for p in pa['parts']),
+              'linked policy export preserves internal FBX part names')
+        unity_applies(S, RPI)
+        sync.stamp_applied()
+        check(not policy.dirty(pi, S) and not policy.dirty(unity_model, S), 'shared linked asset policy is acknowledged without a followup loop')
+    finally:
+        materials.Images.save, materials.Images.mask = save_image, mask_image
 
     # ---- undone in Unity: syncing is refused
     write_json(S['statusPath'], {'sessionId': 'sess1', 'state': 'undone', 'message': 'undone', 'time': ''})
@@ -372,7 +534,7 @@ def run(root):
 
     # ---- add-on pieces
     from aa_bridge import launch
-    compile(launch.STUB_TEXT.format(tools=TOOLS), 'stub', 'exec')
+    compile(launch.STUB_TEXT.format(tools=TOOLS, release_version=(0, 3, 0)), 'stub', 'exec')
     check(True, 'add-on stub compiles')
     ui.register_once()
     check(hasattr(bpy.types, 'AABRIDGE_PT_selection'), 'panels register')
