@@ -1,20 +1,19 @@
-"""The asset library Unity feeds: BlenderSessions/_library/AA_UnityLibrary.blend.
+"""The asset library Unity feeds: BlenderSessions/_library/UnityLibrary.blend.
 
 Each Unity asset (prefab, or a mesh + materials combination) is one collection holding its mesh objects; scene files
-link these collections and place instances, so every asset exists once. Prefabs are marked as assets with a catalog
-per Unity folder, so they can be dragged in from the Asset Browser ("AA Unity" library). Blender-made assets link the
+link these collections and place instances, so every asset exists once. Prefabs in the library folders are marked as
+assets with a catalog per Unity folder, so they can be dragged in from the Asset Browser. Blender-made assets link the
 collection from their source .blend instead. Runs in a background Blender (launch.build_library); only what changed
-is rebuilt, the rest is a cache.
+is rebuilt, and assets no scene uses any more are removed.
 """
 import hashlib
 import json
 import os
-import struct
 import uuid
 
 import bpy
-import numpy as np
 
+from . import aamesh
 from .common import mat, progress, read_json, srgb_to_linear, write_json
 
 NS = uuid.UUID('6b1f0c6e-4f2a-4f7e-9a51-3c2b9e1f7a10')
@@ -23,56 +22,6 @@ INDEX = 'library_index.json'
 
 def catalog_id(path):
     return str(uuid.uuid5(NS, path))
-
-
-def load_aamesh(me, path):
-    b = open(path, 'rb').read()
-    if b[:4] != b'AAM1':
-        raise ValueError(f'{path}: not an AAM1 mesh')
-    n, flags, ns = struct.unpack_from('<iii', b, 4)
-    off = 16
-    counts = np.frombuffer(b, '<i4', ns, off).astype(np.int64)
-    off += 4 * ns
-    pos = np.frombuffer(b, '<f4', n * 3, off)
-    off += 12 * n
-    nrm = uv = None
-    if flags & 1:
-        nrm = np.frombuffer(b, '<f4', n * 3, off)
-        off += 12 * n
-    if flags & 2:
-        uv = np.frombuffer(b, '<f4', n * 2, off)
-        off += 8 * n
-    counts -= counts % 3
-    total = int(counts.sum())
-    idx = np.frombuffer(b, '<i4', total, off)
-
-    me.clear_geometry()
-    me.vertices.add(n)
-    me.vertices.foreach_set('co', pos)
-    nt = total // 3
-    if nt:
-        me.loops.add(total)
-        me.loops.foreach_set('vertex_index', idx)
-        me.polygons.add(nt)
-        me.polygons.foreach_set('loop_start', np.arange(0, total, 3, dtype=np.int32))
-        try:
-            me.polygons.foreach_set('loop_total', np.full(nt, 3, dtype=np.int32))
-        except (AttributeError, TypeError, RuntimeError):
-            pass  # derived from loop_start in newer Blender
-        me.polygons.foreach_set('material_index', np.repeat(np.arange(ns, dtype=np.int32), counts // 3))
-        if uv is not None:
-            layer = me.uv_layers.new(name='UVMap')
-            layer.data.foreach_set('uv', uv.reshape(-1, 2)[idx].ravel())
-    me.update()
-    if nrm is not None and nt:
-        me.polygons.foreach_set('use_smooth', np.ones(nt, dtype=bool))
-        try:
-            me.normals_split_custom_set_from_vertices(nrm.reshape(-1, 3))
-        except Exception:
-            pass
-    me.validate(clean_customdata=False)
-    while len(me.materials) < ns:
-        me.materials.append(None)
 
 
 def _image(path, non_color):
@@ -88,6 +37,7 @@ def _image(path, non_color):
 
 
 def build_material(md, m=None):
+    """Viewport approximation of a Unity material (Principled BSDF). Rebuilt only when Unity's description changed."""
     sig = hashlib.md5(json.dumps(md, sort_keys=True).encode()).hexdigest()
     if m is None:
         m = bpy.data.materials.new(md['name'] or 'Material')
@@ -96,7 +46,8 @@ def build_material(md, m=None):
         return m
     m['aa_sig'] = sig
     m.use_fake_user = True
-    m.use_nodes = True
+    if hasattr(m, 'use_nodes') and not m.use_nodes:
+        m.use_nodes = True  # always on (and deprecated) in Blender 5
     nt = m.node_tree
     nt.nodes.clear()
     out = nt.nodes.new('ShaderNodeOutputMaterial')
@@ -190,6 +141,62 @@ def build_material(md, m=None):
     return m
 
 
+def _fill_collection(c, a, meshes, mats):
+    for o in list(c.objects):
+        bpy.data.objects.remove(o)
+    for ch in list(c.children):
+        c.children.unlink(ch)
+    c['aa_kind'] = a['kind']
+    c['aa_has_lods'] = int(bool(a.get('hasLods')))
+    if a['kind'] == 'blender':
+        c['aa_bb_key'] = a['bbKey']
+        c['aa_source'] = a['source']
+        try:
+            with bpy.data.libraries.load(a['source'], link=True) as (src, dst):
+                dst.collections = [n for n in src.collections if n == a['sourceCollection']]
+            if dst.collections and dst.collections[0]:
+                c.children.link(dst.collections[0])
+        except Exception as e:
+            print(f"AA_WARN source {a['source']}: {e}", flush=True)
+        return
+    for k in ('aa_bb_key', 'aa_source'):
+        if k in c:
+            del c[k]
+    many = len(a['parts']) > 1
+    for i, p in enumerate(a['parts']):
+        me = meshes.get(p['mesh'])
+        if me is None:
+            continue
+        o = bpy.data.objects.new(f"{a['name']}_{i}" if many else a['name'], me)
+        for s, mk in enumerate(p['mats']):
+            if s < len(o.material_slots):
+                o.material_slots[s].link = 'OBJECT'
+                o.material_slots[s].material = mats.get(mk)
+        o.matrix_world = mat(p['m'])
+        o['aa_part'] = p.get('path', '')  # where this part sits inside the Unity prefab
+        c.objects.link(o)
+
+
+def _prune(colls, live, mats, used_mats, meshes, used_meshes):
+    """Assets no scene uses any more (deleted prefabs, old scene meshes) go, so the Asset Browser shows no ghosts."""
+    removed = 0
+    for k, c in list(colls.items()):
+        if k in live:
+            continue
+        for o in list(c.objects):
+            bpy.data.objects.remove(o)
+        bpy.data.collections.remove(c)
+        del colls[k]
+        removed += 1
+    for k, m in list(mats.items()):
+        if k not in used_mats and m.users <= 1:   # only the fake user left
+            bpy.data.materials.remove(m)
+    for k, me in list(meshes.items()):
+        if k not in used_meshes and me.users == 0:
+            bpy.data.meshes.remove(me)
+    return removed
+
+
 def build(lib_json):
     L = read_json(lib_json)
     blend = L['blend']
@@ -204,8 +211,9 @@ def build(lib_json):
     colls = {c['aa_key']: c for c in bpy.data.collections if c.get('aa_key') and not c.library}
     files = {r['key']: r['file'] for r in L['meshes']}
     assets = L['assets']
+    keep = set(L.get('keep', []))
     needed = sorted({p['mesh'] for a in assets for p in a['parts']})
-    steps = len(L['materials']) + len(needed) + len(assets)
+    steps = len(L['materials']) + len(needed) + len(assets) + 1
     step = 0
 
     for md in L['materials']:
@@ -225,7 +233,7 @@ def build(lib_json):
             me['aa_key'] = k
             meshes[k] = me
         try:
-            load_aamesh(me, f)
+            aamesh.load(me, f)
             me['aa_file'] = f
             built += 1
         except Exception as e:
@@ -245,36 +253,8 @@ def build(lib_json):
             colls[a['key']] = c
         c.use_fake_user = True
         if c.get('aa_sig') != sig:
-            for o in list(c.objects):
-                bpy.data.objects.remove(o)
-            for ch in list(c.children):
-                c.children.unlink(ch)
+            _fill_collection(c, a, meshes, mats)
             c['aa_sig'] = sig
-            c['aa_kind'] = a['kind']
-            if a['kind'] == 'blender':
-                c['aa_bb_key'] = a['bbKey']
-                c['aa_source'] = a['source']
-                try:
-                    with bpy.data.libraries.load(a['source'], link=True) as (src, dst):
-                        dst.collections = [n for n in src.collections if n == a['sourceCollection']]
-                    if dst.collections and dst.collections[0]:
-                        c.children.link(dst.collections[0])
-                except Exception as e:
-                    print(f"AA_WARN source {a['source']}: {e}", flush=True)
-            else:
-                many = len(a['parts']) > 1
-                for i, p in enumerate(a['parts']):
-                    me = meshes.get(p['mesh'])
-                    if me is None:
-                        continue
-                    o = bpy.data.objects.new(f"{a['name']}_{i}" if many else a['name'], me)
-                    for s, mk in enumerate(p['mats']):
-                        if s < len(o.material_slots):
-                            o.material_slots[s].link = 'OBJECT'
-                            o.material_slots[s].material = mats.get(mk)
-                    o.matrix_world = mat(p['m'])
-                    o['aa_part'] = p.get('path', '')  # where this part sits inside the Unity prefab
-                    c.objects.link(o)
             rebuilt += 1
         if c.name != a['name'] and not bpy.data.collections.get(a['name']):
             c.name = a['name']
@@ -289,6 +269,21 @@ def build(lib_json):
             c.asset_clear()
         if step % 50 == 0:
             progress(step, steps, f'assets ({rebuilt} rebuilt)')
+
+    # assets only other scenes still use: kept for their Blender files, hidden from the Asset Browser
+    current = {a['key'] for a in assets}
+    for k in keep - current:
+        c = colls.get(k)
+        if c is not None and c.asset_data is not None:
+            c.asset_clear()
+    used_mats = {m['key'] for m in L['materials']}
+    for k in keep - current:
+        c = colls.get(k)
+        for o in (c.all_objects if c is not None else []):
+            for s in o.material_slots:
+                if s.material is not None and s.material.get('aa_key'):
+                    used_mats.add(s.material['aa_key'])
+    pruned = _prune(colls, current | keep, mats, used_mats, meshes, set(needed))
 
     # Asset Browser catalogs (Unity folders), merged with whatever is already there
     cat_file = os.path.join(L['dir'], 'blender_assets.cats.txt')
@@ -312,4 +307,5 @@ def build(lib_json):
     bpy.ops.wm.save_as_mainfile(filepath=blend, compress=False, relative_remap=False)
     write_json(os.path.join(L['dir'], INDEX), {k: c.name for k, c in colls.items()})
     progress(steps, steps, 'saved')
-    print(f'AA_LIBRARY_DONE assets={len(assets)} rebuilt={rebuilt} meshes={built}', flush=True)
+    print(f'AA_LIBRARY_DONE assets={len(assets)} rebuilt={rebuilt} meshes={built} pruned={pruned}', flush=True)
+    return {'assets': len(assets), 'rebuilt': rebuilt, 'meshes': built, 'pruned': pruned}

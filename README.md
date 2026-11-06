@@ -5,13 +5,14 @@ throwaway and can be rebuilt from Unity at any time. Nothing in `BlenderSessions
 
 ## Install
 
-Unity 6, Blender 4.2 or newer (Windows). In the project's `Packages/manifest.json`:
+Unity 6 (URP), Blender 4.2 or newer (tested with 5.2), Windows. In the project's `Packages/manifest.json`:
 
 ```json
-"com.auleek.blenderbridge": "https://github.com/<owner>/UnityBlenderBridge.git#v0.1.0"
+"com.auleek.blenderbridge": "https://github.com/WasifSheikh/UnityBlenderBridge.git#v0.2.0"
 ```
 
-Change the tag to update. The first time you open the window, set **Blender (this PC)** if it isn't found.
+Change the tag to update. Blender is found automatically (Program Files, Steam); otherwise set it under
+**Settings > This PC** in the window.
 
 ### Working on the bridge itself
 
@@ -19,17 +20,24 @@ Clone this repo into the game's `Packages/` folder (e.g. `Packages/com.auleek.bl
 folder in the game repo. Unity uses an embedded package instead of the one in `manifest.json`, so you edit the bridge
 live while everyone else stays on the tagged version. Commit and tag here, then bump the tag in the game's manifest.
 
+Test the Blender side without Unity: `blender -b --factory-startup --python Tests~/test_blender_side.py`.
+
 ## Use it
 
-1. Unity: **Tools > Blender Bridge** (or your project's own menu entry), then **Open in Blender**.
-   - First time per scene, tick which root objects Blender may edit (*Editable in Blender*). Everything else comes along
-     as locked context. The choice is saved for the team in `ProjectSettings/BlenderBridge.asset`.
-   - If a Blender file for the scene already exists you can continue it or start fresh. Lost it? Just open again.
-2. Blender: work as usual.
-   - Move, rotate, scale, delete, rename, Shift+D anything in *Unity (editable)*.
-   - To model a Unity object (Edit Mode, extrude, loop cuts...): select it, **Unity tab > Make editable**. Unity objects
-     come in as linked instances; this turns them into local geometry. Unity materials stay the real ones, and later
-     edits come back from the saved source (modifiers intact). On sync:
+1. Unity: **Tools > Blender Bridge**, then **Open in Blender**.
+   - The status pill at the top says where the scene stands: *Not opened*, *Ready*, *Blender open*, *Changes
+     waiting*, *Conflicts*, *Out of sync*.
+   - **Editable objects** tab: tick which root objects Blender may edit. Everything else comes along as locked
+     context. Saved for the team in `ProjectSettings/BlenderBridge.asset`.
+   - With a Blender file already there, the button continues it; the ▾ menu can start fresh instead (and opens the
+     session folder, backups and the library build log).
+2. Blender: work as usual. The **Unity** tab in the sidebar (N) shows what the selected object is to the bridge.
+   - Move, rotate, scale, delete, rename, Shift+D anything in *Unity (editable)*. Shift+D on a group copies the group;
+     its children are copied only if you selected them too, as in Blender.
+   - To model a Unity object (Edit Mode, extrude, loop cuts...): select it, **Make editable**. Unity objects come in
+     as linked instances; this turns them into local geometry. By default the mesh is cleaned up for modelling
+     (vertices Unity splits at seams welded, hard edges marked sharp, UV breaks marked as seams, triangles joined
+     into quads); untick it to keep the exact Unity mesh. Unity materials stay the real ones. On sync:
      - a plain mesh object keeps its components and collider and gets the new mesh;
      - for a **prefab instance** you choose:
        - **Only this one (new variant)**: a Prefab Variant of the original, used by this instance. It inherits every
@@ -37,13 +45,18 @@ live while everyone else stays on the tagged version. Commit and tag here, then 
        - **The prefab itself (all copies)**: the geometry goes into the original prefab, so every copy in every scene
          changes. The prefab is backed up first. Model files and package prefabs can't be edited this way; they get a
          variant instead.
-     Parts are matched to the prefab's children by their path; new objects become new parts, deleted parts are switched off.
-   - Drag project prefabs in from the Asset Browser, library **AA Unity** (one catalog per Unity folder).
+     Parts are matched to the prefab's children by their path; new objects become new parts (static, with a collider
+     when the prefab's parts have one); deleted parts are switched off. A LOD group keeps only the new LOD0.
+   - Blender-made assets reopen from their saved source (modifiers intact) when you Make editable them. If someone
+     changed one in Unity since (other meshes or materials), Blender gets the Unity version instead.
+   - Drag project prefabs in from the Asset Browser, library **Unity: &lt;project&gt;** (one catalog per folder).
    - Model new things. Every new top-level object with geometry becomes its own asset; its origin is the pivot.
-     Custom property `collider` on it: `mesh` (default), `box` or `none`.
-3. Blender: **Unity tab > Sync to Unity**. Unity applies it within a few seconds (or shows a preview if something
+     Collider (**Mesh / Box / None** in the panel, custom property `collider`). Changing it later replaces the old
+     collider.
+3. Blender: **Sync to Unity**. Unity applies it within a few seconds (or shows the changes for review if something
    conflicts, or if auto-apply is off). One Ctrl+Z in Unity undoes the scene part; a backup of the scene is kept in
-   `SyncBackups/BlenderBridge/`.
+   `SyncBackups/BlenderBridge/`. If you do undo a sync, the session is marked *Out of sync* (Blender refuses to send
+   more) until you start fresh.
 
 ## Assemble sections from multiple artists
 
@@ -51,18 +64,21 @@ Copy the sections into the same bridge session, then sync once. Keep each reusab
 object, a mesh hierarchy under its own root, or a Blender collection instance. Matching exported geometry,
 materials, part layout and collider settings share one prefab in that sync. Each copy keeps its own scene
 transform. A plain Empty above a mesh hierarchy makes that hierarchy one asset. Use Blender Collections
-for section organization, or set the Blender custom property `map_group` to true on an Empty that is
-only used to organize a section. Its child assets keep their world transforms in Unity.
+for section organization, or mark an Empty as a **Section group** (panel button, custom property `map_group`) when it
+only organises a section: its child assets keep their world transforms in Unity.
 
-For Blender collection instances, each source collection is a reusable prefab. Pack external textures before
-handing off the source files. Keep the same geometry and pivot for copies that should share a prefab.
+For Blender collection instances, each source collection is one reusable prefab: more placements later reuse it, and
+editing the collection re-exports that prefab, so every placement follows. Pack external textures before handing
+off the source files. Keep the same geometry and pivot for copies that should share a prefab.
 
 ## What Unity makes from a Blender model (key K)
 
-Under the **Asset root** setting (default `Assets/BlenderBridge/{scene}`, `{scene}` = scene name): `Meshes/SM_K.fbx`, `Materials/M_K_<material>.mat` (URP Lit),
-`Textures/K/T_K_<material>_BC|N|MS|E.png` (textures already in the project are reused, not copied),
-`Prefabs/PF_K.prefab` (static, with colliders, label `BlenderAsset`), and `Source~/K.blend`, the editable source the
-next Blender session uses. Re-syncing an edited asset updates these in place, so every instance follows.
+Under the **Asset root** setting (default `Assets/BlenderBridge/{scene}`, `{scene}` = scene name): `Meshes/SM_K.fbx`,
+`Materials/M_K_<material>.mat` (URP Lit), `Textures/K/T_K_<material>_BC|N|MS|E.png` (textures already in the project
+are reused, not copied), `Prefabs/PF_K.prefab` (static, with colliders, label `BlenderAsset`), and `Source~/K.blend`,
+the editable source the next Blender session uses. The model and every prefab built from K carry the label `BBKey_K`,
+which is how they are found again even if the asset root setting changes. Re-syncing an edited asset updates these in
+place, so every instance follows. A UV2 made in Blender is kept as the lightmap UV; otherwise Unity generates one.
 
 ## Good to know
 
@@ -71,23 +87,34 @@ next Blender session uses. Re-syncing an edited asset updates these in place, so
   geometry of the other copies; Unity holds that sync for review with a warning.
 - Blender shows Unity materials approximately (custom shaders become base colour/texture, normal, metal/smooth).
   Unity keeps the real materials. Materials of Blender-made assets are owned by Blender: a re-sync overwrites them.
-- If the same object changed in Unity and in Blender since the last sync, Unity's version is kept unless you tick it.
+- If the same object changed in Unity and in Blender since the last sync, Unity's version is kept unless you tick it
+  (or press *Take Blender's for all*). Transforms are compared relative to the parent, so moving a group in one place
+  doesn't make its children conflict.
+- If a sync fails half way (e.g. a texture can't be imported), nothing in the scene changes; the assets that were
+  already built are reused when you Apply again, not built twice.
+- Objects added under a prefab instance in the scene are editable in Blender too.
 - New lights, cameras and empties made in Blender are not sent to Unity.
 - Geometry Nodes instances should be realized (Object > Apply > Visual Geometry to Mesh) before syncing.
+- Blender-made source files (`Source~/*.blend`) are committed with packed textures; consider Git LFS for `*.blend`.
 
 ## Settings
 
 `ProjectSettings/BlenderBridge.asset` (commit it): editable roots per scene, library folders (what appears in
-Blender's Asset Browser), auto-apply, and the asset root. The Blender executable is stored per PC.
+Blender's Asset Browser) and paths to leave out, auto-apply, and the asset root. The Blender executable is stored per PC.
 
-To put the window in your own menu, call `Auleek.BlenderBridge.Editor.BBWindow.Open()` or
-`EditorApplication.ExecuteMenuItem("Tools/Blender Bridge")` from a `[MenuItem]` of yours.
+To put the window in your own menu, call `Auleek.BlenderBridge.Editor.BBWindow.Open()` from a `[MenuItem]` of yours
+(the assembly is auto-referenced), or `EditorApplication.ExecuteMenuItem("Tools/Blender Bridge")`.
 
 ## Files
 
-- Unity side: `Editor/` (assembly `Auleek.BlenderBridge.Editor`).
-- Blender side: `BlenderAddon~/aa_bridge/` (Unity ignores `~` folders). Unity starts Blender with it; it also
-  installs a small `aa_unity_bridge` add-on so the Unity tab is there when a session file is opened by hand.
+- Unity side: `Editor/` (assembly `Auleek.BlenderBridge.Editor`):
+  `BBModels` (exchange format), `BBCore` (paths, axes, utilities), `BBSettings`, `BBExport` + `BBMeshWriter` +
+  `BBMaterialReader` (Unity -> Blender), `BBPlan` (three-way diff), `BBApply` + `BBSceneOps` (applying),
+  `BBAssets` + `BBPrefabBuilder` + `BBMaterialWriter` (Blender-made assets), `BBLauncher`, `BBWindow` + `BBStyles`,
+  `BBWatcher`.
+- Blender side: `BlenderAddon~/` (Unity ignores `~` folders). Unity starts Blender with `bb_entry.py`, which runs
+  `aa_bridge`; it also installs a small `aa_unity_bridge` add-on so the Unity tab is there when a session file is
+  opened by hand (it only appears in bridge session files).
 - Working files, in the Unity project: `BlenderSessions/` (git-ignored automatically): `_cache` (converted
-  meshes/textures), `_library` (`AA_UnityLibrary.blend`), `<Scene>/` (snapshot, .blend, exchange files).
-  Scene backups before each sync: `SyncBackups/BlenderBridge/` (ignore it in git too).
+  meshes/textures; unused meshes are cleaned up), `_library` (`UnityLibrary.blend`), `<Scene>_<guid>/` (snapshot,
+  .blend, exchange files). Scene backups before each sync: `SyncBackups/BlenderBridge/` (git-ignored automatically).

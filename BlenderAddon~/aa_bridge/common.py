@@ -1,8 +1,15 @@
+"""Small shared helpers and the names both sides agree on."""
 import json
 import os
 import re
 
 from mathutils import Matrix
+
+FORMAT_VERSION = 2               # BBFormat.Version on the Unity side
+SOURCE_COLLECTION = 'AA_Asset'   # BBAssets.SourceCollection
+GEO = {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT'}
+EDIT = 'Unity (editable)'
+CONTEXT = 'Unity context (locked)'
 
 
 def read_json(path):
@@ -11,6 +18,7 @@ def read_json(path):
 
 
 def write_json(path, data):
+    """Through a temp file, so Unity never reads a half-written file."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
@@ -35,9 +43,22 @@ def progress(i, n, msg):
 def slug(s):
     s = re.sub(r'\.\d{3}$', '', s or 'asset')
     s = re.sub(r'[^A-Za-z0-9_-]+', '_', s).strip('_')
+    s = re.sub(r'_+', '_', s)
     return s or 'asset'
 
 
 def srgb_to_linear(c):
     c = max(0.0, float(c))
     return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def scene_json(scene, key, default=None):
+    """A JSON value kept in a scene custom property (dicts don't survive as ID properties cleanly)."""
+    try:
+        return json.loads(scene.get(key, ''))
+    except (TypeError, ValueError):
+        return {} if default is None else default
+
+
+def set_scene_json(scene, key, value):
+    scene[key] = json.dumps(value, sort_keys=True)

@@ -9,11 +9,8 @@ import os
 
 import bpy
 
-from .common import mat, read_json, srgb_to_linear
+from .common import CONTEXT, EDIT, mat, read_json, srgb_to_linear
 from .library import INDEX
-
-EDIT = 'Unity (editable)'
-CONTEXT = 'Unity context (locked)'
 
 
 def session_path():
@@ -25,28 +22,26 @@ def load():
     return read_json(p) if p and os.path.exists(p) else None
 
 
-def ensure_asset_library(lib_dir):
-    """Registers BlenderSessions/_library as the "AA Unity" asset library (link, not append)."""
+def ensure_asset_library(lib_dir, name):
+    """Registers BlenderSessions/_library as an asset library (link, not append). Preferences are not saved here:
+    Unity registers it again on every launch, and saving would also store unrelated unsaved preference changes."""
     prefs = bpy.context.preferences
     d = os.path.normcase(os.path.normpath(lib_dir))
     libs = prefs.filepaths.asset_libraries
-    for lib in libs:
-        if os.path.normcase(os.path.normpath(bpy.path.abspath(lib.path))) == d:
-            return
-    try:
-        lib = libs.new(name='AA Unity', directory=lib_dir)
-    except Exception:
-        bpy.ops.preferences.asset_library_add(directory=lib_dir)
-        lib = libs[-1]
-        lib.name = 'AA Unity'
+    lib = next((x for x in libs if os.path.normcase(os.path.normpath(bpy.path.abspath(x.path))) == d), None)
+    if lib is None:
+        try:
+            lib = libs.new(name=name, directory=lib_dir)
+        except Exception:
+            bpy.ops.preferences.asset_library_add(directory=lib_dir)
+            lib = libs[-1]
+    if lib.name != name:
+        lib.name = name
     try:
         lib.import_method = 'LINK'
     except Exception:
         pass
-    try:
-        bpy.ops.wm.save_userpref()
-    except Exception:
-        pass
+    return lib.name
 
 
 def _light(n):
@@ -62,6 +57,10 @@ def _light(n):
     return data
 
 
+def _library_name(S):
+    return S.get('libraryName') or 'Unity'
+
+
 def build(path):
     S = read_json(path)
     index_path = os.path.join(os.path.dirname(S['library']), INDEX)
@@ -72,6 +71,7 @@ def build(path):
     scene.name = S['scene']
     scene['aa_session'] = S['sessionId']
     scene['aa_session_json'] = path
+    scene['aa_tools'] = S.get('tools') or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     scene['aa_status'] = 'Built from Unity ' + S.get('created', '').replace('T', ' ')
     scene.unit_settings.system = 'METRIC'
 
@@ -90,6 +90,7 @@ def build(path):
     scene.collection.children.link(ctx)
     ctx.hide_select = True
     ctx.color_tag = 'COLOR_07'
+    edit.color_tag = 'COLOR_05'
 
     objs, hidden, missing = {}, [], 0
     for n in S['nodes']:
@@ -104,8 +105,6 @@ def build(path):
                     o.instance_type = 'COLLECTION'
                     o.instance_collection = c
                     o.empty_display_size = 0.1
-                    if c.get('aa_bb_key'):
-                        o['aa_bb_instance'] = c['aa_bb_key']
                 else:
                     missing += 1
                     o.empty_display_type = 'CUBE'
@@ -134,14 +133,16 @@ def build(path):
     for o in hidden:
         o.hide_set(True)
 
-    ensure_asset_library(os.path.dirname(S['library']))
+    scene['aa_library'] = ensure_asset_library(os.path.dirname(S['library']), _library_name(S))
     bpy.ops.wm.save_as_mainfile(filepath=S['blend'], relative_remap=False)
-    msg = f"{len([n for n in S['nodes'] if n.get('editable')])} editable, {len([n for n in S['nodes'] if not n.get('editable')])} context objects"
+    n_edit = sum(1 for n in S['nodes'] if n.get('editable'))
+    msg = f"{n_edit} editable, {len(S['nodes']) - n_edit} context objects"
     if missing:
         msg += f', {missing} without a library asset'
     scene['aa_status'] = 'Built from Unity: ' + msg
     print('AA_SESSION_BUILT ' + msg, flush=True)
-    bpy.app.timers.register(setup_view, first_interval=0.5)
+    if not bpy.app.background:
+        bpy.app.timers.register(setup_view, first_interval=0.5)
 
 
 def resume(path):
@@ -150,8 +151,10 @@ def resume(path):
     if S and scene.get('aa_session') != S['sessionId']:
         scene['aa_status'] = 'This file is not the current Unity session; open the scene from Unity again.'
     if S:
-        ensure_asset_library(os.path.dirname(S['library']))
-    bpy.app.timers.register(setup_view, first_interval=0.5)
+        scene['aa_tools'] = S.get('tools') or scene.get('aa_tools', '')
+        scene['aa_library'] = ensure_asset_library(os.path.dirname(S['library']), _library_name(S))
+    if not bpy.app.background:
+        bpy.app.timers.register(setup_view, first_interval=0.5)
 
 
 def setup_view():

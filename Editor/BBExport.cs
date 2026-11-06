@@ -2,11 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text;
-using Unity.Collections;
 using UnityEditor;
 using UnityEngine;
-using UnityEngine.Rendering;
 using UnityEngine.SceneManagement;
 using UMesh = UnityEngine.Mesh;
 
@@ -14,27 +11,34 @@ namespace Auleek.BlenderBridge.Editor
 {
     /// <summary>
     /// Unity -> Blender. Writes the scene snapshot (session.json) and the asset library description (library.json),
-    /// converting every mesh and the textures Blender cannot read into the shared cache. Prefab instances are atomic
+    /// converting meshes and the textures Blender cannot read into the shared cache. Prefab instances are atomic
     /// nodes that instance the prefab's library asset; plain mesh objects instance a mesh asset; everything else in an
     /// editable root becomes an empty, so the hierarchy survives. Objects outside the editable roots are sent as
     /// locked context (visuals only, flat).
+    ///
+    /// Scales with big libraries: an asset whose dependency hash is the same as in the previous library.json is
+    /// reused without loading the prefab, and meshes are converted only when their cache file is missing.
     /// </summary>
     public class BBExport
     {
         public BBSession session;
         public BBLibrary lib;
-        public int meshesWritten, texturesBaked;
+        public int meshesWritten, assetsReused;
         public readonly List<string> warnings = new List<string>();
 
         readonly Dictionary<string, BBAsset> assets = new Dictionary<string, BBAsset>();
         readonly Dictionary<string, BBMaterial> mats = new Dictionary<string, BBMaterial>();
+        readonly Dictionary<string, BBMeshRef> meshRefs = new Dictionary<string, BBMeshRef>();
         readonly Dictionary<UMesh, string> meshKeys = new Dictionary<UMesh, string>();
         readonly Dictionary<Material, string> matKeys = new Dictionary<Material, string>();
-        readonly Dictionary<Texture, string> texPaths = new Dictionary<Texture, string>();
         readonly HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         Dictionary<GameObject, string> ids;
+        BBMaterialReader reader;
+        Dictionary<string, BBAsset> prevAssets = new Dictionary<string, BBAsset>();
+        Dictionary<string, BBMeshRef> prevMeshes = new Dictionary<string, BBMeshRef>();
+        Dictionary<string, BBMaterial> prevMats = new Dictionary<string, BBMaterial>();
 
-        static readonly string[] BlenderReadable = { ".png", ".jpg", ".jpeg", ".tga", ".tif", ".tiff", ".exr", ".bmp", ".hdr", ".psd", ".dds", ".webp" };
+        public int TexturesBaked => reader?.baked ?? 0;
 
         public static BBExport Run(Scene scene, ICollection<string> editableRootIds)
         {
@@ -46,56 +50,114 @@ namespace Auleek.BlenderBridge.Editor
 
         void Export(Scene scene, HashSet<string> editable)
         {
-            string sn = scene.name;
+            string key = BBPaths.Key(scene);
             session = new BBSession
             {
-                sessionId = Guid.NewGuid().ToString("N"), scene = sn, scenePath = scene.path, sceneGuid = AssetDatabase.AssetPathToGUID(scene.path),
-                created = DateTime.Now.ToString("s"), library = BBPaths.LibraryBlend, libraryJson = BBPaths.LibraryJson, blend = BBPaths.Blend(sn),
-                project = BBPaths.Project, assetRoot = BBPaths.AssetRoot(sn), outDir = BBPaths.OutDir(sn), appliedPath = BBPaths.AppliedJson(sn),
+                sessionId = Guid.NewGuid().ToString("N"), key = key, scene = scene.name, scenePath = scene.path, sceneGuid = AssetDatabase.AssetPathToGUID(scene.path),
+                created = DateTime.Now.ToString("s"), library = BBPaths.LibraryBlend, libraryJson = BBPaths.LibraryJson, libraryName = BBPaths.LibraryName,
+                blend = BBPaths.Blend(key), project = BBPaths.Project, assetRoot = BBPaths.AssetRoot(scene.name), outDir = BBPaths.OutDir(key),
+                appliedPath = BBPaths.AppliedJson(key), statusPath = BBPaths.StatusJson(key), tools = BBPaths.Tools,
             };
-            lib = new BBLibrary { blend = BBPaths.LibraryBlend, dir = BBPaths.LibraryDir };
+            lib = new BBLibrary { blend = BBPaths.LibraryBlend, dir = BBPaths.LibraryDir, libraryName = BBPaths.LibraryName };
+            reader = new BBMaterialReader(warnings);
             Directory.CreateDirectory(BBPaths.MeshCache);
             Directory.CreateDirectory(BBPaths.TexCache);
             Directory.CreateDirectory(BBPaths.LibraryDir);
+            LoadPrevious();
 
-            var all = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<Transform>(true)).Select(t => t.gameObject).ToArray();
-            var gids = new GlobalObjectId[all.Length];
-            GlobalObjectId.GetGlobalObjectIdsSlow(all, gids);
+            var all = BBUtil.AllObjects(scene);
+            var gids = BBUtil.Goids(all);
             ids = new Dictionary<GameObject, string>(all.Length);
-            for (int i = 0; i < all.Length; i++) ids[all[i]] = gids[i].ToString();
+            for (int i = 0; i < all.Length; i++) ids[all[i]] = gids[i];
 
             var roots = scene.GetRootGameObjects();
             for (int i = 0; i < roots.Length; i++)
             {
-                EditorUtility.DisplayProgressBar("Blender Bridge", $"Reading {roots[i].name}", 0.6f * i / Mathf.Max(1, roots.Length));
+                EditorUtility.DisplayProgressBar("Blender Bridge", $"Reading {roots[i].name}", 0.5f * i / Mathf.Max(1, roots.Length));
                 Walk(roots[i], "", editable.Contains(ids[roots[i]]), new HashSet<GameObject>());
             }
 
             // the asset library: every prefab in the library folders, plus every Blender-made asset in the project
-            var paths = BBSettings.instance.libraryFolders.Where(AssetDatabase.IsValidFolder)
-                .SelectMany(f => AssetDatabase.FindAssets("t:Prefab", new[] { f })).Select(AssetDatabase.GUIDToAssetPath)
-                .Where(p => !p.Contains("/_")).ToList();
-            paths.AddRange(AssetDatabase.FindAssets("l:" + BBAssets.Label + " t:Prefab").Select(AssetDatabase.GUIDToAssetPath));
-            paths = paths.Distinct().ToList();
+            var s = BBSettings.instance;
+            var paths = s.libraryFolders.Select(f => f.Trim().TrimEnd('/')).Where(AssetDatabase.IsValidFolder).Distinct()
+                         .SelectMany(f => AssetDatabase.FindAssets("t:Prefab", new[] { f })).Select(AssetDatabase.GUIDToAssetPath)
+                         .Where(p => !s.Excluded(p))
+                         .Concat(AssetDatabase.FindAssets("l:" + BBAssets.Label + " t:Prefab").Select(AssetDatabase.GUIDToAssetPath))
+                         .Distinct().ToList();
             for (int i = 0; i < paths.Count; i++)
             {
-                if (i % 20 == 0) EditorUtility.DisplayProgressBar("Blender Bridge", "Asset library: " + Path.GetFileNameWithoutExtension(paths[i]), 0.6f + 0.4f * i / paths.Count);
-                var go = AssetDatabase.LoadAssetAtPath<GameObject>(paths[i]);
-                if (go) PrefabAsset(paths[i], go);
+                if (i % 25 == 0) EditorUtility.DisplayProgressBar("Blender Bridge", "Asset library: " + Path.GetFileNameWithoutExtension(paths[i]), 0.5f + 0.5f * i / paths.Count);
+                PrefabAsset(paths[i]);
             }
             lib.assets = assets.Values.ToList();
             lib.materials = mats.Values.ToList();
+            lib.meshes = meshRefs.Values.ToList();
+            lib.keep = KeptByOtherSessions(key);
         }
 
         public void Save()
         {
             BBPaths.EnsureGitIgnore();
             BBUtil.Write(BBPaths.LibraryJson, BBUtil.Json(lib));
-            BBUtil.Write(BBPaths.SessionJson(session.scene), BBUtil.Json(session));
+            BBUtil.Write(BBPaths.SessionJson(session.key), BBUtil.Json(session));
+            BBUtil.Write(BBPaths.StatusJson(session.key), BBUtil.Json(new BBStatus { sessionId = session.sessionId, time = DateTime.Now.ToString("s") }));
+            PruneMeshCache();
         }
 
         public string Summary => $"{session.nodes.Count(n => n.editable)} editable + {session.nodes.Count(n => !n.editable)} context objects, " +
-                                 $"{assets.Count} library assets, {meshesWritten} meshes converted, {texturesBaked} textures baked";
+                                 $"{assets.Count} library assets ({assetsReused} unchanged), {meshesWritten} meshes converted, {TexturesBaked} textures baked";
+
+        // ================================================================ reuse of the previous export
+        void LoadPrevious()
+        {
+            var prev = BBUtil.Read<BBLibrary>(BBPaths.LibraryJson);
+            if (prev == null || prev.version != BBFormat.Version) return;
+            prevAssets = prev.assets.GroupBy(a => a.key).ToDictionary(g => g.Key, g => g.First());
+            prevMeshes = prev.meshes.GroupBy(m => m.key).ToDictionary(g => g.Key, g => g.First());
+            prevMats = prev.materials.GroupBy(m => m.key).ToDictionary(g => g.Key, g => g.First());
+        }
+
+        bool TryReuse(string key, string hash, bool browsable, string catalog)
+        {
+            if (!prevAssets.TryGetValue(key, out var a) || a.hash != hash) return false;
+            var meshes = a.parts.Select(p => p.mesh).Distinct().ToList();
+            if (meshes.Any(m => !prevMeshes.TryGetValue(m, out var r) || !File.Exists(r.file))) return false;
+            var matKeysUsed = a.parts.SelectMany(p => p.mats ?? Array.Empty<string>()).Where(k => k != "").Distinct().ToList();
+            if (matKeysUsed.Any(m => !prevMats.ContainsKey(m))) return false;
+            foreach (var m in meshes) meshRefs[m] = prevMeshes[m];
+            foreach (var m in matKeysUsed) if (!mats.ContainsKey(m)) mats[m] = prevMats[m];
+            a.name = UniqueName(a.name);
+            a.browsable = browsable;
+            a.catalog = catalog;
+            assets[key] = a;
+            assetsReused++;
+            return true;
+        }
+
+        static List<string> KeptByOtherSessions(string current)
+        {
+            var keep = new HashSet<string>();
+            if (!Directory.Exists(BBPaths.Root)) return keep.ToList();
+            foreach (var dir in Directory.GetDirectories(BBPaths.Root))
+            {
+                string name = Path.GetFileName(dir);
+                if (name.StartsWith("_") || name == current) continue;
+                var s = BBUtil.Read<BBSession>(dir + "/session.json");
+                if (s?.nodes != null) foreach (var n in s.nodes) if (!string.IsNullOrEmpty(n.asset)) keep.Add(n.asset);
+            }
+            return keep.ToList();
+        }
+
+        void PruneMeshCache()
+        {
+            try
+            {
+                var used = new HashSet<string>(lib.meshes.Select(m => Path.GetFullPath(m.file)), StringComparer.OrdinalIgnoreCase);
+                foreach (var f in Directory.GetFiles(BBPaths.MeshCache, "*.aamesh"))
+                    if (!used.Contains(Path.GetFullPath(f)) && (DateTime.Now - File.GetLastWriteTime(f)).TotalDays > 1) File.Delete(f);
+            }
+            catch (Exception e) { warnings.Add("mesh cache cleanup: " + e.Message); }
+        }
 
         // ================================================================ scene
         void Walk(GameObject go, string parentId, bool editable, HashSet<GameObject> hiddenLods)
@@ -110,17 +172,21 @@ namespace Auleek.BlenderBridge.Editor
             if (PrefabUtility.IsOutermostPrefabInstanceRoot(go))
             {
                 string path = PrefabUtility.GetPrefabAssetPathOfNearestInstanceRoot(go);
-                var asset = string.IsNullOrEmpty(path) ? null : AssetDatabase.LoadAssetAtPath<GameObject>(path);
-                if (asset)
+                string key = string.IsNullOrEmpty(path) ? null : PrefabAsset(path);
+                if (key != null)
                 {
                     n.kind = "instance";
-                    n.asset = PrefabAsset(path, asset);
+                    n.asset = key;
                     session.nodes.Add(n);
-                    return;  // prefab instances are atomic: their insides stay Unity's
+                    // prefab instances are atomic (their insides stay Unity's), but objects added under them in the
+                    // scene are the scene's own and stay editable
+                    foreach (var c in PrefabUtility.GetAddedGameObjects(go))
+                        if (c.instanceGameObject.transform.parent == go.transform) Walk(c.instanceGameObject, editable ? id : "", editable, hiddenLods);
+                    return;
                 }
             }
-            if (go.TryGetComponent<LODGroup>(out var lg)) HideLods(lg, hiddenLods);
-            if (!hiddenLods.Contains(go) && MeshOf(go, out var mesh, out var materials))
+            if (go.TryGetComponent<LODGroup>(out var lg)) BBAssets.HideLods(lg, hiddenLods);
+            if (!hiddenLods.Contains(go) && BBAssets.MeshOf(go, out var mesh, out var materials))
             {
                 n.kind = "instance";
                 n.asset = MeshAsset(mesh, materials, go.name);
@@ -135,26 +201,6 @@ namespace Auleek.BlenderBridge.Editor
             foreach (Transform c in go.transform) Walk(c.gameObject, editable ? id : "", editable, hiddenLods);
         }
 
-        static void HideLods(LODGroup lg, HashSet<GameObject> hidden)
-        {
-            var lods = lg.GetLODs();
-            if (lods.Length < 2) return;
-            var keep = new HashSet<Renderer>(lods[0].renderers.Where(r => r));
-            for (int i = 1; i < lods.Length; i++)
-                foreach (var r in lods[i].renderers)
-                    if (r && !keep.Contains(r)) hidden.Add(r.gameObject);
-        }
-
-        static bool MeshOf(GameObject go, out UMesh mesh, out Material[] materials)
-        {
-            mesh = null; materials = null;
-            if (go.TryGetComponent<MeshFilter>(out var mf) && mf.sharedMesh && go.TryGetComponent<MeshRenderer>(out var mr) && mr.enabled)
-            { mesh = mf.sharedMesh; materials = mr.sharedMaterials; return true; }
-            if (go.TryGetComponent<SkinnedMeshRenderer>(out var smr) && smr.sharedMesh && smr.enabled)
-            { mesh = smr.sharedMesh; materials = smr.sharedMaterials; return true; }
-            return false;
-        }
-
         // ================================================================ library assets
         string UniqueName(string n)
         {
@@ -166,304 +212,109 @@ namespace Auleek.BlenderBridge.Editor
             return r;
         }
 
+        /// <summary>Asset Browser catalog: the folder below the library folder it was found in (trailing Prefabs/Meshes/
+        /// Models dropped), prefixed with that library folder's name.</summary>
         static string Catalog(string path)
         {
-            var parts = Path.GetDirectoryName(path).Replace('\\', '/').Split('/').ToList();
-            int i = parts.IndexOf("Environment");
-            var rest = i >= 0 ? parts.Skip(i + 1).ToList() : parts.Skip(1).ToList();
-            while (rest.Count > 1 && (rest[rest.Count - 1] == "Prefabs" || rest[rest.Count - 1] == "Meshes" || rest[rest.Count - 1] == "Models")) rest.RemoveAt(rest.Count - 1);
-            if (rest.Count == 0) rest.Add("Other");
-            return string.Join("/", rest);
+            string folder = BBSettings.instance.LibraryFolderOf(path);
+            string dir = Path.GetDirectoryName(path).Replace('\\', '/');
+            string rel = folder != null && dir.Length > folder.Length ? dir.Substring(folder.Length + 1) : "";
+            var parts = rel.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries).ToList();
+            while (parts.Count > 0 && (parts[parts.Count - 1] == "Prefabs" || parts[parts.Count - 1] == "Meshes" || parts[parts.Count - 1] == "Models")) parts.RemoveAt(parts.Count - 1);
+            parts.Insert(0, folder != null ? Path.GetFileName(folder) : "Other");
+            return string.Join("/", parts);
         }
 
-        string PrefabAsset(string path, GameObject root)
+        string PrefabAsset(string path)
         {
-            string key = "prefab:" + AssetDatabase.AssetPathToGUID(path);
+            string guid = AssetDatabase.AssetPathToGUID(path);
+            string key = "prefab:" + guid;
             if (assets.ContainsKey(key)) return key;
-            var a = new BBAsset
-            {
-                key = key, name = UniqueName(root.name), kind = "prefab", catalog = Catalog(path), prefab = path, browsable = !path.Contains("/_"),
-                hash = AssetDatabase.GetAssetDependencyHash(path).ToString(),
-            };
+            var s = BBSettings.instance;
+            bool browsable = s.LibraryFolderOf(path) != null && !s.Excluded(path);
+            string catalog = Catalog(path);
+
+            // Blender-made (or Blender-edited) prefab whose editable source is still current
+            string bbk = BBAssets.KeyFromLabels(new GUID(guid));
+            string src = bbk != null ? BBAssets.SourceBlendForKey(bbk) : "";
+            bool hasSrc = !string.IsNullOrEmpty(src) && File.Exists(src);
+            string hash = AssetDatabase.GetAssetDependencyHash(path).ToString();
+            if (bbk != null) hash += "|" + Hash128.Compute(AssetImporter.GetAtPath(path)?.userData ?? "") + (hasSrc ? "|" + File.GetLastWriteTimeUtc(src).Ticks : "");
+            if (TryReuse(key, hash, browsable, hasSrc ? "Blender made" : catalog)) return key;
+
+            var root = AssetDatabase.LoadAssetAtPath<GameObject>(path);
+            if (!root) return null;
+            var a = new BBAsset { key = key, name = UniqueName(root.name), kind = "prefab", catalog = catalog, prefab = path, browsable = browsable, hash = hash };
             assets[key] = a;
 
-            string bbk = BBAssets.KeyFromLabels(root) ?? (AssetDatabase.GetLabels(root).Contains(BBAssets.Label) ? BBAssets.KeyOf(path) : null);
-            if (bbk != null)
+            if (hasSrc)
             {
-                string src = BBAssets.SourceBlendForKey(bbk);
-                if (File.Exists(src))
+                var meta = BBAssets.ReadMeta(path);
+                if (meta == null || string.IsNullOrEmpty(meta.parts) || meta.parts == BBAssets.PartsSignature(root))
                 {
-                    string slug = bbk;
                     a.kind = "blender";
                     a.source = src;
-                    a.sourceCollection = "AA_Asset";  // sync.py SOURCE_COLLECTION
-                    a.bbKey = slug;
+                    a.sourceCollection = BBAssets.SourceCollection;
+                    a.bbKey = bbk;
                     a.catalog = "Blender made";
-                    a.hash += "|" + File.GetLastWriteTimeUtc(src).Ticks;
                     return key;
                 }
+                warnings.Add($"{root.name}: its geometry was changed in Unity since Blender last wrote it, so Blender gets the Unity version (the source .blend is out of date)");
             }
 
-            var hidden = new HashSet<GameObject>();
-            foreach (var g in root.GetComponentsInChildren<LODGroup>(true)) HideLods(g, hidden);
-            var inv = root.transform.worldToLocalMatrix;
-            foreach (var t in root.GetComponentsInChildren<Transform>(true))
-            {
-                if (hidden.Contains(t.gameObject) || !ActiveUnder(t, root.transform)) continue;
-                if (!MeshOf(t.gameObject, out var mesh, out var materials)) continue;
-                a.parts.Add(new BBPart
-                {
-                    mesh = MeshKey(mesh), mats = materials.Select(MatKey).ToArray(),
-                    m = BBConvert.Flat(BBConvert.ToBlender(inv * t.localToWorldMatrix)),
-                    path = t == root.transform ? "" : AnimationUtility.CalculateTransformPath(t, root.transform),
-                });
-            }
+            var parts = BBAssets.VisibleParts(root);
+            a.hasLods = root.GetComponentsInChildren<LODGroup>(true).Any(g => g.lodCount > 1);
+            foreach (var p in parts)
+                a.parts.Add(new BBPart { mesh = MeshKey(p.mesh), mats = p.materials.Select(MatKey).ToArray(), m = BBConvert.Flat(p.blenderMatrix), path = p.path });
             return key;
-        }
-
-        static bool ActiveUnder(Transform t, Transform root)
-        {
-            for (; t; t = t.parent)
-            {
-                if (!t.gameObject.activeSelf) return false;
-                if (t == root) return true;
-            }
-            return true;
         }
 
         string MeshAsset(UMesh mesh, Material[] materials, string name)
         {
             // a mesh modelled in Blender earlier: offer it from its source, so it can be edited again with modifiers intact
-            string mp = AssetDatabase.GetAssetPath(mesh);
-            if (mp.Contains("/Blender/Meshes/SM_"))
+            string bbk = BBAssets.KeyOfModelMesh(mesh);
+            if (bbk != null)
             {
-                string k = Path.GetFileNameWithoutExtension(mp).Substring(3);
-                string pf = BBAssets.FindPrefab(k);
-                if (pf != null && File.Exists(BBAssets.SourceBlendForKey(k))) return PrefabAsset(pf, AssetDatabase.LoadAssetAtPath<GameObject>(pf));
+                string pf = BBAssets.FindPrefab(bbk);
+                if (pf != null && File.Exists(BBAssets.SourceBlendForKey(bbk))) { var k = PrefabAsset(pf); if (k != null) return k; }
             }
             string mk = MeshKey(mesh);
             var mks = materials.Select(MatKey).ToArray();
-            string key = "mesh:" + Hash128.Compute(mk + "|" + string.Join(",", mks)).ToString().Substring(0, 16);
+            string key = "mesh:" + BBUtil.Short(Hash128.Compute(mk + "|" + string.Join(",", mks)).ToString(), 16);
             if (!assets.ContainsKey(key))
                 assets[key] = new BBAsset
                 {
-                    key = key, name = UniqueName(name), kind = "mesh", hash = "1", browsable = false,
+                    key = key, name = UniqueName(name), kind = "mesh", hash = mk, browsable = false,
                     parts = { new BBPart { mesh = mk, mats = mks, m = BBConvert.Flat(Matrix4x4.identity) } },
                 };
             return key;
         }
 
-        // ================================================================ meshes
+        // ================================================================ meshes and materials
         string MeshKey(UMesh mesh)
         {
+            if (!mesh) return "";
             if (meshKeys.TryGetValue(mesh, out var k)) return k;
-            string path = AssetDatabase.GetAssetPath(mesh), hash;
-            if (!string.IsNullOrEmpty(path) && AssetDatabase.TryGetGUIDAndLocalFileIdentifier(mesh, out string guid, out long lid))
-            {
-                k = guid + "_" + lid;
-                hash = path.StartsWith("Assets") || path.StartsWith("Packages") ? AssetDatabase.GetAssetDependencyHash(path).ToString() : "builtin";
-            }
-            else
-            {
-                k = "scene_" + Hash128.Compute(mesh.name + "|" + mesh.vertexCount + "|" + mesh.bounds).ToString().Substring(0, 12);
-                hash = session.sessionId;
-            }
-            string file = $"{BBPaths.MeshCache}/{k}__{hash.Substring(0, Math.Min(12, hash.Length))}.aamesh";
+            k = BBAssets.MeshId(mesh, out string hash);
+            string file = $"{BBPaths.MeshCache}/{k}__{BBUtil.Short(hash)}.aamesh";
             if (!File.Exists(file))
             {
-                try { WriteMesh(mesh, file); meshesWritten++; }
+                try { BBMeshWriter.Write(mesh, file); meshesWritten++; }
                 catch (Exception e) { warnings.Add($"mesh {mesh.name}: {e.Message}"); }
             }
-            lib.meshes.Add(new BBMeshRef { key = k, file = file });
+            meshRefs[k] = new BBMeshRef { key = k, file = file };
             meshKeys[mesh] = k;
             return k;
         }
 
-        /// <summary>AAM1: "AAM1", int verts, int flags (1 normals, 2 uv0), int submeshes, int indexCount per submesh,
-        /// float3 positions, [float3 normals], [float2 uv0], int indices. All in Blender space, winding flipped.</summary>
-        static void WriteMesh(UMesh mesh, string file)
-        {
-            using (var arr = UMesh.AcquireReadOnlyMeshData(mesh))
-            {
-                var d = arr[0];
-                int n = d.vertexCount;
-                bool hasN = d.HasVertexAttribute(VertexAttribute.Normal), hasUv = d.HasVertexAttribute(VertexAttribute.TexCoord0);
-                var subs = new List<int[]>();
-                for (int s = 0; s < d.subMeshCount; s++)
-                {
-                    var sm = d.GetSubMesh(s);
-                    if (sm.topology != MeshTopology.Triangles) { subs.Add(new int[0]); continue; }
-                    var ia = new NativeArray<int>(sm.indexCount, Allocator.Temp);
-                    d.GetIndices(ia, s, true);
-                    var a = ia.ToArray();
-                    ia.Dispose();
-                    for (int i = 0; i + 2 < a.Length; i += 3) { int t = a[i + 1]; a[i + 1] = a[i + 2]; a[i + 2] = t; }
-                    subs.Add(a);
-                }
-                string tmp = file + ".tmp";
-                using (var w = new BinaryWriter(File.Create(tmp)))
-                {
-                    w.Write(Encoding.ASCII.GetBytes("AAM1"));
-                    w.Write(n);
-                    w.Write((hasN ? 1 : 0) | (hasUv ? 2 : 0));
-                    w.Write(subs.Count);
-                    foreach (var a in subs) w.Write(a.Length);
-                    var v3 = new NativeArray<Vector3>(n, Allocator.Temp);
-                    d.GetVertices(v3);
-                    WriteV3(w, v3);
-                    if (hasN) { d.GetNormals(v3); WriteV3(w, v3); }
-                    v3.Dispose();
-                    if (hasUv)
-                    {
-                        var uv = new NativeArray<Vector2>(n, Allocator.Temp);
-                        d.GetUVs(0, uv);
-                        var f = new float[n * 2];
-                        for (int i = 0; i < n; i++) { f[i * 2] = uv[i].x; f[i * 2 + 1] = uv[i].y; }
-                        uv.Dispose();
-                        WriteRaw(w, f);
-                    }
-                    foreach (var a in subs) WriteRaw(w, a);
-                }
-                if (File.Exists(file)) File.Delete(file);
-                File.Move(tmp, file);
-            }
-        }
-
-        static void WriteV3(BinaryWriter w, NativeArray<Vector3> v)
-        {
-            var f = new float[v.Length * 3];
-            for (int i = 0; i < v.Length; i++) { f[i * 3] = -v[i].x; f[i * 3 + 1] = -v[i].z; f[i * 3 + 2] = v[i].y; }
-            WriteRaw(w, f);
-        }
-
-        static void WriteRaw(BinaryWriter w, Array a)
-        {
-            var b = new byte[Buffer.ByteLength(a)];
-            Buffer.BlockCopy(a, 0, b, 0, b.Length);
-            w.Write(b);
-        }
-
-        // ================================================================ materials
         string MatKey(Material m)
         {
             if (!m) return "";
             if (matKeys.TryGetValue(m, out var k)) return k;
-            k = AssetDatabase.TryGetGUIDAndLocalFileIdentifier(m, out string guid, out long lid) && !string.IsNullOrEmpty(guid)
-                ? guid + "_" + lid
-                : "inst_" + Hash128.Compute(m.name + "|" + (m.shader ? m.shader.name : "")).ToString().Substring(0, 12);
+            k = BBMaterialReader.KeyOf(m);
             matKeys[m] = k;
-            if (!mats.ContainsKey(k)) mats[k] = Describe(m, k);
+            if (!mats.ContainsKey(k)) mats[k] = reader.Describe(m, k);
             return k;
-        }
-
-        /// <summary>A viewport approximation of any shader: base colour/texture, normal, metal/smooth, emission, alpha.</summary>
-        BBMaterial Describe(Material m, string key)
-        {
-            var d = new BBMaterial { key = key, name = m.name, shader = m.shader ? m.shader.name : "" };
-            var col = FirstColor(m, "_BaseColor", "_Color", "_MainColor", "_TintColor", "_Tint", "_AlbedoColor") ?? Color.white;
-            d.color = new[] { col.r, col.g, col.b, col.a };
-            var bt = FirstTex(m, out string prop, "_BaseMap", "_MainTex", "_BaseColorMap", "_AlbedoMap", "_Albedo", "_DiffuseMap", "_Diffuse")
-                     ?? ScanTex(m, out prop, "albedo", "basecolor", "base", "diffuse", "main", "color");
-            d.baseMap = TexPath(bt, false);
-            if (bt && prop != null)
-            {
-                var s = m.GetTextureScale(prop); var o = m.GetTextureOffset(prop);
-                d.tiling = new[] { s.x, s.y, o.x, o.y };
-            }
-            else d.tiling = new[] { 1f, 1f, 0f, 0f };
-            var nt = FirstTex(m, out _, "_BumpMap", "_NormalMap", "_Normal", "_NormalTex") ?? ScanTex(m, out _, "normal", "bump");
-            d.normalMap = TexPath(nt, true);
-            d.normalScale = Float(m, 1f, "_BumpScale", "_NormalScale", "_NormalStrength");
-            d.metallic = Float(m, 0f, "_Metallic");
-            d.smoothness = Float(m, 0.5f, "_Smoothness", "_Glossiness");
-            var ec = m.HasColor("_EmissionColor") ? m.GetColor("_EmissionColor") : Color.black;
-            bool emissive = ec.maxColorComponent > 0.001f && (m.IsKeywordEnabled("_EMISSION") || d.shader != "Universal Render Pipeline/Lit");
-            d.emission = emissive ? new[] { ec.r, ec.g, ec.b } : new[] { 0f, 0f, 0f };
-            d.emissionMap = emissive ? TexPath(FirstTex(m, out _, "_EmissionMap", "_EmissiveColorMap", "_EmissionTex"), false) : "";
-            if (Float(m, 0f, "_Surface") > 0.5f) d.alpha = "blend";
-            else if (Float(m, 0f, "_AlphaClip") > 0.5f || m.IsKeywordEnabled("_ALPHATEST_ON")) { d.alpha = "clip"; d.cutoff = Float(m, 0.5f, "_Cutoff"); }
-            return d;
-        }
-
-        static Color? FirstColor(Material m, params string[] props)
-        {
-            foreach (var p in props) if (m.HasColor(p)) return m.GetColor(p);
-            return null;
-        }
-
-        static float Float(Material m, float fallback, params string[] props)
-        {
-            foreach (var p in props) if (m.HasFloat(p)) return m.GetFloat(p);
-            return fallback;
-        }
-
-        static Texture FirstTex(Material m, out string prop, params string[] props)
-        {
-            foreach (var p in props)
-                if (m.HasTexture(p)) { var t = m.GetTexture(p); if (t is Texture2D) { prop = p; return t; } }
-            prop = null;
-            return null;
-        }
-
-        static Texture ScanTex(Material m, out string prop, params string[] tokens)
-        {
-            prop = null;
-            var sh = m.shader;
-            if (!sh) return null;
-            foreach (var tok in tokens)
-                for (int i = 0; i < sh.GetPropertyCount(); i++)
-                {
-                    if (sh.GetPropertyType(i) != ShaderPropertyType.Texture) continue;
-                    string n = sh.GetPropertyName(i);
-                    if (!n.ToLowerInvariant().Contains(tok)) continue;
-                    var t = m.GetTexture(n);
-                    if (t is Texture2D) { prop = n; return t; }
-                }
-            return null;
-        }
-
-        string TexPath(Texture t, bool normal)
-        {
-            if (!(t is Texture2D t2)) return "";
-            if (texPaths.TryGetValue(t, out var p)) return p;
-            p = "";
-            string ap = AssetDatabase.GetAssetPath(t);
-            string ext = Path.GetExtension(ap).ToLowerInvariant();
-            if (BlenderReadable.Contains(ext))
-            {
-                if (ap.StartsWith("Assets/")) p = BBPaths.Full(ap);
-                else if (ap.StartsWith("Packages/")) { var full = FileUtil.GetPhysicalPath(ap); if (File.Exists(full)) p = Path.GetFullPath(full).Replace('\\', '/'); }
-            }
-            if (p == "" && !normal) p = Bake(t2, ap);  // Blender can't read it (or it's generated): bake a PNG once
-            texPaths[t] = p;
-            return p;
-        }
-
-        string Bake(Texture2D t, string ap)
-        {
-            string hash = string.IsNullOrEmpty(ap) || ap.StartsWith("Library")
-                ? Hash128.Compute(t.name + "|" + t.width + "x" + t.height).ToString()
-                : AssetDatabase.GetAssetDependencyHash(ap).ToString();
-            string file = $"{BBPaths.TexCache}/{BBUtil.Slug(t.name)}_{hash.Substring(0, 12)}.png";
-            if (File.Exists(file)) return file;
-            float s = Mathf.Min(1f, 2048f / Mathf.Max(t.width, t.height));
-            int w = Mathf.Max(1, (int)(t.width * s)), h = Mathf.Max(1, (int)(t.height * s));
-            var rt = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
-            var prev = RenderTexture.active;
-            try
-            {
-                Graphics.Blit(t, rt);
-                RenderTexture.active = rt;
-                var tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
-                tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
-                tex.Apply();
-                File.WriteAllBytes(file, tex.EncodeToPNG());
-                UnityEngine.Object.DestroyImmediate(tex);
-                texturesBaked++;
-                return file;
-            }
-            catch (Exception e) { warnings.Add($"texture {t.name}: {e.Message}"); return ""; }
-            finally { RenderTexture.active = prev; RenderTexture.ReleaseTemporary(rt); }
         }
     }
 }
