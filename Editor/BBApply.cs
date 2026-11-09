@@ -70,6 +70,7 @@ namespace Auleek.BlenderBridge.Editor
             File.Move(rj, done);
             string progress = BBPaths.ImportProgress(plan.key);
             if (File.Exists(progress)) File.Delete(progress);
+            BBSavedUpdates.PruneSpent(plan.key);
             Journal(plan, summary);
             foreach (var l in ctx.log) Debug.LogWarning("[Blender Bridge] " + l);
             Debug.Log($"[Blender Bridge] {plan.sceneName}: {summary}. Backup: {plan.backupDir}");

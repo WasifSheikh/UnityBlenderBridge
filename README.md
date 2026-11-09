@@ -103,6 +103,24 @@ Internal FBX part names remain stable to preserve mesh fileIDs. A Blender UV2 is
 Open a fresh bridge session after updating the package to receive the current profiles and controls; preserve
 any unsynced work first. Old version-2 sessions remain readable, and Unity uses current project profiles when importing.
 
+## What Blender gets
+
+By default (**Settings > What Blender gets > Mesh objects only**) a scene comes into Blender as its meshes:
+
+- mesh prefabs (props, buildings, vehicles, road pieces), as one instance each; lights or particles inside a prop
+  prefab are part of it and stay Unity's;
+- plain mesh objects (MeshFilter + MeshRenderer, e.g. roads and ground), unless **Also plain mesh objects** is off;
+- the groups those sit in, so the hierarchy survives.
+
+Everything else stays in Unity and no sync ever changes it: lights, Volumes, Adaptive Probe Volumes, reflection and
+light probes, cameras, timelines, particle/VFX prefabs, characters (anything with a skinned mesh), UI, gameplay
+helpers and empty objects. Objects with a component from the skip list (by class name; editable in Settings) are left
+out even when they have a mesh, and so are meshes whose materials all use an effect shader (name containing Fog, Haze,
+Volumetric or Particles/, also editable), such as fog and haze volumes. If you delete a group in Blender that also holds such hidden objects in Unity, they
+are kept and move up one level; Shift+D of a group copies them along. **Everything** restores the old behaviour.
+The setting applies the next time a scene is opened with **Start fresh**. **Preview for this scene** (next to the
+setting, or **Tools > Blender Bridge: Preview What Blender Gets**) shows the counts without starting Blender.
+
 ## Good to know
 
 - Pivots: the Blender object origin is the Unity pivot. Set Origin before syncing to choose it. Rotation and scale stay

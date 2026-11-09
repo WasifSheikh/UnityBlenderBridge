@@ -82,7 +82,13 @@ namespace Auleek.BlenderBridge.Editor
         public List<BBMaterial> materials = new List<BBMaterial>();
         public List<BBAsset> assets = new List<BBAsset>();
         public List<string> keep = new List<string>();   // asset keys other scenes' Blender files still link
+        // Unity-only bookkeeping (Blender ignores these): library prefabs left out by the content rules, so the next
+        // export can skip them without loading them again.
+        public string contentFilter = "";
+        public List<BBSkipped> skipped = new List<BBSkipped>();
     }
+
+    [Serializable] public class BBSkipped { public string key, hash; }
 
     /// <summary>Unity's state of the session, read by Blender (status line, and "undone" blocks syncing).</summary>
     [Serializable] public class BBStatus

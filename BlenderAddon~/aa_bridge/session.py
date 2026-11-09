@@ -18,9 +18,24 @@ def session_path():
     return bpy.context.scene.get('aa_session_json', '')
 
 
+_cache = {'key': None, 'data': None}
+
+
 def load():
+    """session.json, parsed once per change. The panel draws and the 2-second status timer ask for it constantly, and
+    for a big scene it is megabytes of JSON. Callers treat the result as read-only."""
     p = session_path()
-    return read_json(p) if p and os.path.exists(p) else None
+    if not p:
+        return None
+    try:
+        st = os.stat(p)
+    except OSError:
+        return None
+    key = (os.path.normcase(os.path.abspath(p)), st.st_mtime_ns, st.st_size)
+    if _cache['key'] != key:
+        _cache['data'] = read_json(p)
+        _cache['key'] = key
+    return _cache['data']
 
 
 def ensure_asset_library(lib_dir, name):

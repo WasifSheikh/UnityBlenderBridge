@@ -18,12 +18,16 @@ namespace Auleek.BlenderBridge.Editor
     ///
     /// Scales with big libraries: an asset whose dependency hash is the same as in the previous library.json is
     /// reused without loading the prefab, and meshes are converted only when their cache file is missing.
+    ///
+    /// Content rules (Settings > What Blender gets): by default only mesh prefabs and plain mesh objects are sent.
+    /// Lights, volumes, probes, cameras, FX and helper empties stay in Unity and are never touched by a sync; an empty
+    /// group is only sent when something under it is, so the hierarchy of the props survives.
     /// </summary>
     public class BBExport
     {
         public BBSession session;
         public BBLibrary lib;
-        public int meshesWritten, assetsReused;
+        public int meshesWritten, assetsReused, objectsWalked, librarySkipped;
         public readonly List<string> warnings = new List<string>();
 
         readonly Dictionary<string, BBAsset> assets = new Dictionary<string, BBAsset>();
@@ -37,6 +41,11 @@ namespace Auleek.BlenderBridge.Editor
         Dictionary<string, BBAsset> prevAssets = new Dictionary<string, BBAsset>();
         Dictionary<string, BBMeshRef> prevMeshes = new Dictionary<string, BBMeshRef>();
         Dictionary<string, BBMaterial> prevMats = new Dictionary<string, BBMaterial>();
+        Dictionary<string, string> prevSkipped = new Dictionary<string, string>();
+        string prevContentFilter = "";
+        readonly List<BBSkipped> skipped = new List<BBSkipped>();
+        readonly Dictionary<UMesh, string> modelKeyOf = new Dictionary<UMesh, string>();
+        BBContentFilter filter;
 
         public int TexturesBaked => reader?.baked ?? 0;
 
@@ -68,6 +77,7 @@ namespace Auleek.BlenderBridge.Editor
             if (string.IsNullOrEmpty(session.defaultDestination)) session.defaultDestination = BBSettings.instance.defaultDestination;
             lib = new BBLibrary { blend = BBPaths.LibraryBlend, dir = BBPaths.LibraryDir, libraryName = BBPaths.LibraryName };
             reader = new BBMaterialReader(warnings);
+            filter = new BBContentFilter(BBSettings.instance);
             Directory.CreateDirectory(BBPaths.MeshCache);
             Directory.CreateDirectory(BBPaths.TexCache);
             Directory.CreateDirectory(BBPaths.LibraryDir);
@@ -85,18 +95,22 @@ namespace Auleek.BlenderBridge.Editor
                 Walk(roots[i], "", editable.Contains(ids[roots[i]]), new HashSet<GameObject>());
             }
 
-            // the asset library: every prefab in the library folders, plus every Blender-made asset in the project
+            // the asset library: every mesh prefab in the library folders, plus every Blender-made asset in the project
             var s = BBSettings.instance;
+            var blenderMade = new HashSet<string>(AssetDatabase.FindAssets("l:" + BBAssets.Label + " t:Prefab").Select(AssetDatabase.GUIDToAssetPath));
             var paths = s.libraryFolders.Select(f => f.Trim().TrimEnd('/')).Where(AssetDatabase.IsValidFolder).Distinct()
                          .SelectMany(f => AssetDatabase.FindAssets("t:Prefab", new[] { f })).Select(AssetDatabase.GUIDToAssetPath)
                          .Where(p => !s.Excluded(p))
-                         .Concat(AssetDatabase.FindAssets("l:" + BBAssets.Label + " t:Prefab").Select(AssetDatabase.GUIDToAssetPath))
+                         .Concat(blenderMade)
                          .Distinct().ToList();
             for (int i = 0; i < paths.Count; i++)
             {
                 if (i % 25 == 0) EditorUtility.DisplayProgressBar("Blender Bridge", "Asset library: " + Path.GetFileNameWithoutExtension(paths[i]), 0.5f + 0.5f * i / paths.Count);
+                if (!blenderMade.Contains(paths[i]) && !LibraryWanted(paths[i])) continue;
                 PrefabAsset(paths[i]);
             }
+            lib.contentFilter = filter.Signature;
+            lib.skipped = skipped;
             lib.assets = assets.Values.ToList();
             lib.materials = mats.Values.ToList();
             lib.meshes = meshRefs.Values.ToList();
@@ -112,8 +126,10 @@ namespace Auleek.BlenderBridge.Editor
             PruneMeshCache();
         }
 
-        public string Summary => $"{session.nodes.Count(n => n.editable)} editable + {session.nodes.Count(n => !n.editable)} context objects, " +
-                                 $"{assets.Count} library assets ({assetsReused} unchanged), {meshesWritten} meshes converted, {TexturesBaked} textures baked";
+        public string Summary => $"{session.nodes.Count(n => n.editable)} editable + {session.nodes.Count(n => !n.editable)} context objects" +
+                                 (filter != null && filter.MeshesOnly ? $" ({Math.Max(0, objectsWalked - session.nodes.Count)} non-mesh objects left in Unity)" : "") +
+                                 $", {assets.Count} library assets ({assetsReused} unchanged" + (librarySkipped > 0 ? $", {librarySkipped} non-mesh prefabs left out" : "") +
+                                 $"), {meshesWritten} meshes converted, {TexturesBaked} textures baked";
 
         // ================================================================ reuse of the previous export
         void LoadPrevious()
@@ -123,6 +139,28 @@ namespace Auleek.BlenderBridge.Editor
             prevAssets = prev.assets.GroupBy(a => a.key).ToDictionary(g => g.Key, g => g.First());
             prevMeshes = prev.meshes.GroupBy(m => m.key).ToDictionary(g => g.Key, g => g.First());
             prevMats = prev.materials.GroupBy(m => m.key).ToDictionary(g => g.Key, g => g.First());
+            prevContentFilter = prev.contentFilter ?? "";
+            if (prev.skipped != null) prevSkipped = prev.skipped.Where(x => x?.key != null).GroupBy(x => x.key).ToDictionary(g => g.Key, g => g.First().hash);
+        }
+
+        /// <summary>Whether a library prefab is mesh content. Decided without loading the prefab when it is unchanged
+        /// since the last export under the same content rules.</summary>
+        bool LibraryWanted(string path)
+        {
+            if (!filter.MeshesOnly) return true;
+            string key = "prefab:" + AssetDatabase.AssetPathToGUID(path);
+            if (assets.ContainsKey(key)) return true;   // placed in the scene and already judged there
+            string hash = AssetDatabase.GetAssetDependencyHash(path).ToString();
+            if (prevContentFilter == filter.Signature)
+            {
+                if (prevSkipped.TryGetValue(key, out var h) && h == hash) { skipped.Add(new BBSkipped { key = key, hash = hash }); librarySkipped++; return false; }
+                if (prevAssets.TryGetValue(key, out var a) && a.hash == hash) return true;
+            }
+            var root = AssetDatabase.LoadAssetAtPath<GameObject>(path);
+            if (root && filter.IsMeshPrefab(root)) return true;
+            skipped.Add(new BBSkipped { key = key, hash = hash });
+            librarySkipped++;
+            return false;
         }
 
         bool TryReuse(string key, string hash, bool browsable, string catalog)
@@ -168,19 +206,25 @@ namespace Auleek.BlenderBridge.Editor
         }
 
         // ================================================================ scene
-        void Walk(GameObject go, string parentId, bool editable, HashSet<GameObject> hiddenLods)
+        /// <summary>Adds go (and what is under it) to the snapshot. Returns true when anything of its subtree was added,
+        /// so a group with nothing to show is dropped again (content rules: meshes only).</summary>
+        bool Walk(GameObject go, string parentId, bool editable, HashSet<GameObject> hiddenLods)
         {
-            if ((go.hideFlags & (HideFlags.HideInHierarchy | HideFlags.DontSave)) != 0) return;
+            if ((go.hideFlags & (HideFlags.HideInHierarchy | HideFlags.DontSave)) != 0) return false;
+            objectsWalked++;
+            bool meshesOnly = filter.MeshesOnly;
             string id = ids[go];
             var n = new BBNode
             {
                 id = id, name = go.name, parent = editable ? parentId : "", editable = editable, active = go.activeInHierarchy,
                 m = BBConvert.Flat(BBConvert.ToBlender(go.transform.localToWorldMatrix)),
             };
+            int at = session.nodes.Count;
             if (PrefabUtility.IsOutermostPrefabInstanceRoot(go))
             {
                 string path = PrefabUtility.GetPrefabAssetPathOfNearestInstanceRoot(go);
-                string key = string.IsNullOrEmpty(path) ? null : PrefabAsset(path);
+                bool wanted = !meshesOnly || filter.IsMeshPrefab(go);
+                string key = wanted && !string.IsNullOrEmpty(path) ? PrefabAsset(path) : null;
                 if (key != null)
                 {
                     n.kind = "instance";
@@ -188,25 +232,51 @@ namespace Auleek.BlenderBridge.Editor
                     session.nodes.Add(n);
                     // prefab instances are atomic (their insides stay Unity's), but objects added under them in the
                     // scene are the scene's own and stay editable
-                    foreach (var c in PrefabUtility.GetAddedGameObjects(go))
-                        if (c.instanceGameObject.transform.parent == go.transform) Walk(c.instanceGameObject, editable ? id : "", editable, hiddenLods);
-                    return;
+                    WalkAdded(go, editable ? id : "", editable, hiddenLods);
+                    return true;
+                }
+                if (meshesOnly)
+                {
+                    // not a mesh prefab (FX, light rig, character...): its insides stay Unity's. Only objects added under
+                    // it in the scene can be content; then it comes along as a plain group so they keep their parent.
+                    n.kind = "group";
+                    if (editable) session.nodes.Add(n);
+                    bool anyAdded = WalkAdded(go, editable ? id : "", editable, hiddenLods);
+                    if (!anyAdded && editable) session.nodes.RemoveAt(at);
+                    return anyAdded;
                 }
             }
             if (go.TryGetComponent<LODGroup>(out var lg)) BBAssets.HideLods(lg, hiddenLods);
-            if (!hiddenLods.Contains(go) && BBAssets.MeshOf(go, out var mesh, out var materials))
+            if (!hiddenLods.Contains(go) && BBAssets.MeshOf(go, out var mesh, out var materials) && (!meshesOnly || filter.IsLooseMesh(go)))
             {
                 n.kind = "instance";
                 n.asset = MeshAsset(mesh, materials, go.name);
             }
-            else if (go.TryGetComponent<Light>(out var l))
+            else if (!meshesOnly && go.TryGetComponent<Light>(out var l))
             {
                 n.kind = "light";
                 n.light = new BBLight { type = l.type.ToString(), color = new[] { l.color.r, l.color.g, l.color.b }, intensity = l.intensity, range = l.range, spot = l.spotAngle };
             }
-            else n.kind = go.GetComponent<Renderer>() ? "marker" : "group";
-            if (editable || n.kind == "instance") session.nodes.Add(n);
-            foreach (Transform c in go.transform) Walk(c.gameObject, editable ? id : "", editable, hiddenLods);
+            else n.kind = !meshesOnly && go.GetComponent<Renderer>() ? "marker" : "group";
+            bool content = n.kind == "instance";
+            if (editable || content) session.nodes.Add(n);
+            bool any = false;
+            foreach (Transform c in go.transform) any |= Walk(c.gameObject, editable ? id : "", editable, hiddenLods);
+            if (meshesOnly && !content && !any)
+            {
+                if (editable) session.nodes.RemoveAt(at);   // nothing below was added, so it is still the last node
+                return false;
+            }
+            return true;
+        }
+
+        bool WalkAdded(GameObject instanceRoot, string parentId, bool editable, HashSet<GameObject> hiddenLods)
+        {
+            bool any = false;
+            foreach (var c in PrefabUtility.GetAddedGameObjects(instanceRoot))
+                if (c.instanceGameObject && c.instanceGameObject.transform.parent == instanceRoot.transform)
+                    any |= Walk(c.instanceGameObject, parentId, editable, hiddenLods);
+            return any;
         }
 
         // ================================================================ library assets
@@ -297,7 +367,7 @@ namespace Auleek.BlenderBridge.Editor
         string MeshAsset(UMesh mesh, Material[] materials, string name)
         {
             // a mesh modelled in Blender earlier: offer it from its source, so it can be edited again with modifiers intact
-            string bbk = BBAssets.KeyOfModelMesh(mesh);
+            if (!modelKeyOf.TryGetValue(mesh, out string bbk)) modelKeyOf[mesh] = bbk = BBAssets.KeyOfModelMesh(mesh);
             if (bbk != null)
             {
                 string pf = BBAssets.FindPrefab(bbk);
@@ -340,6 +410,61 @@ namespace Auleek.BlenderBridge.Editor
             matKeys[m] = k;
             if (!mats.ContainsKey(k)) mats[k] = reader.Describe(m, k);
             return k;
+        }
+    }
+
+    /// <summary>The content rules: what counts as a mesh object worth editing in Blender (Settings > What Blender gets).</summary>
+    internal class BBContentFilter
+    {
+        public readonly bool MeshesOnly, looseMeshes;
+        public readonly string Signature;
+        readonly HashSet<string> skip;
+
+        public BBContentFilter(BBSettings s)
+        {
+            MeshesOnly = s.MeshesOnly;
+            looseMeshes = s.includeLooseMeshes;
+            Signature = s.ContentSignature;
+            skip = new HashSet<string>((s.skipComponents ?? new List<string>()).Select(x => x.Trim()).Where(x => x.Length > 0), StringComparer.Ordinal);
+        }
+
+        /// <summary>go carries a component from the skip list (matched by class name).</summary>
+        public bool Skipped(GameObject go)
+        {
+            if (skip.Count == 0) return false;
+            foreach (var c in go.GetComponents<Component>())
+                if (c && skip.Contains(c.GetType().Name)) return true;
+            return false;
+        }
+
+        /// <summary>A prefab (scene instance root or prefab asset root) that is a static mesh: at least one visible
+        /// MeshFilter + MeshRenderer, no skinned (character) meshes, and no skip-listed component on its root. Lights,
+        /// particles and the like inside a prop are fine: the prefab is sent whole and its insides stay Unity's.</summary>
+        public bool IsMeshPrefab(GameObject root)
+        {
+            if (Skipped(root)) return false;
+            bool mesh = false;
+            foreach (var r in root.GetComponentsInChildren<Renderer>(true))
+            {
+                if (!r.enabled || !ActiveUnder(r.transform, root.transform)) continue;
+                if (r is SkinnedMeshRenderer smr) { if (smr.sharedMesh) return false; }
+                else if (!mesh && r is MeshRenderer && r.TryGetComponent<MeshFilter>(out var mf) && mf.sharedMesh) mesh = true;
+            }
+            return mesh;
+        }
+
+        /// <summary>A plain (non-prefab) object with a static mesh, e.g. a road or ground mesh.</summary>
+        public bool IsLooseMesh(GameObject go) =>
+            looseMeshes && go.TryGetComponent<MeshFilter>(out var mf) && mf.sharedMesh && go.TryGetComponent<MeshRenderer>(out var mr) && mr.enabled && !Skipped(go);
+
+        static bool ActiveUnder(Transform t, Transform root)
+        {
+            for (; t; t = t.parent)
+            {
+                if (t == root) return true;
+                if (!t.gameObject.activeSelf) return false;
+            }
+            return true;
         }
     }
 }

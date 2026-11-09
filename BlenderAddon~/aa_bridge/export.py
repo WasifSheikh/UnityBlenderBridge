@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import time
 from contextlib import contextmanager
 
 import bpy
@@ -244,29 +245,191 @@ def _exportable(parts):
         vl.objects.active = active
 
 
+# ---------------------------------------------------------------- export cache
+# Every save in Blender prepares a complete update for Unity, and models that were never synced are exported again on
+# each one (they get a new key every time, until Unity acknowledges them). The files of an export are cached by
+# content: when nothing that goes into them changed, the next save or sync links the cached files in (renamed to the
+# new key) instead of running the FBX exporter and writing the source .blend again.
+CACHE_FORMAT = 1
+CACHE_META = 'aa_cache.json'
+CACHE_KEEP_SECONDS = 3 * 24 * 3600
+CACHE_MAX_ENTRIES = 400
+
+
+def _cache_root():
+    try:
+        from . import session
+        S = session.load()
+    except Exception:
+        return None
+    out = (S or {}).get('outDir')
+    return os.path.join(out, 'export_cache') if out else None
+
+
+def _images_signature(parts):
+    """What the texture files of an export depend on beyond asset_hash (which only sees image names). None when an
+    image has unsaved paint: always export then."""
+    h = hashlib.md5()
+    seen = set()
+    for o in sorted(parts, key=fbx_name):
+        for md in getattr(o, 'modifiers', []):   # the source .blend keeps the modifier stack
+            h.update(f'{md.type}|{md.name}|{md.show_viewport}'.encode())
+        for slot in getattr(o, 'material_slots', []):
+            nt = M.node_tree(slot.material) if slot.material is not None else None
+            for n in (nt.nodes if nt is not None else []):
+                img = getattr(n, 'image', None)
+                if img is None or img.name in seen:
+                    continue
+                seen.add(img.name)
+                if img.is_dirty:
+                    return None
+                h.update(f'{img.name}|{img.source}|{img.filepath}'.encode())
+                if img.packed_file is not None:
+                    h.update(str(img.packed_file.size).encode())
+                else:
+                    path = bpy.path.abspath(img.filepath) if img.filepath else ''
+                    if path and os.path.exists(path):
+                        st = os.stat(path)
+                        h.update(f'{st.st_size}|{st.st_mtime_ns}'.encode())
+    return h.hexdigest()
+
+
+# root properties the source .blend carries that matter when it is reopened (volatile ones such as aa_tmp are left out)
+_SOURCE_PROPS = ('aa_bb_key', 'aa_destination', 'aa_asset_name', 'aa_edit_mode', 'aa_prefab', 'aa_orig_parts', 'map_group')
+
+
+def _cache_signature(root, parts, h, material_mode, sync_textures, project):
+    images = _images_signature(parts)
+    if images is None:
+        return None
+    props = [str(root.get(k, '')) for k in _SOURCE_PROPS]
+    blob = json.dumps([CACHE_FORMAT, h, images, material_mode, sync_textures, project, bpy.app.version_string, props])
+    return hashlib.sha256(blob.encode()).hexdigest()[:24]
+
+
+def _link_tree(src, dst, rename=None):
+    """Hard-links (or copies, across volumes) every file of src into dst. rename maps file names at the top level."""
+    for here, _dirs, files in os.walk(src):
+        rel = os.path.relpath(here, src)
+        target = dst if rel == '.' else os.path.join(dst, rel)
+        os.makedirs(target, exist_ok=True)
+        for f in files:
+            if rel == '.' and f == CACHE_META:
+                continue
+            name = rename.get(f, f) if rename and rel == '.' else f
+            a, b = os.path.join(here, f), os.path.join(target, name)
+            if os.path.exists(b):
+                os.remove(b)
+            try:
+                os.link(a, b)
+            except OSError:
+                shutil.copy2(a, b)
+
+
+def _cache_restore(sig, key, d):
+    """The cached export for sig, linked into d under key. Returns (materials, True) or (None, False)."""
+    root = _cache_root()
+    if not root or not sig:
+        return None, False
+    entry = os.path.join(root, sig)
+    meta_path = os.path.join(entry, CACHE_META)
+    try:
+        with open(meta_path, encoding='utf-8') as f:
+            meta = json.load(f)
+        old = meta['key']
+        for f in (old + '.fbx', old + '.blend'):
+            if not os.path.exists(os.path.join(entry, f)):
+                return None, False
+        _link_tree(entry, d, {old + '.fbx': key + '.fbx', old + '.blend': key + '.blend'})
+        os.utime(meta_path)   # recently used: kept by the pruning
+        return meta['materials'], True
+    except (OSError, ValueError, KeyError):
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+        return None, False
+
+
+def _cache_store(sig, key, d, materials):
+    root = _cache_root()
+    if not root or not sig:
+        return
+    entry = os.path.join(root, sig)
+    try:
+        shutil.rmtree(entry, ignore_errors=True)
+        _link_tree(d, entry)
+        tmp = os.path.join(entry, CACHE_META + '.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({'key': key, 'materials': materials}, f)
+        os.replace(tmp, os.path.join(entry, CACHE_META))   # the entry only counts once it is complete
+        _cache_prune(root)
+    except OSError as e:
+        print('AA_WARN export cache:', e)
+        shutil.rmtree(entry, ignore_errors=True)
+
+
+def _cache_prune(root):
+    entries = []
+    for name in os.listdir(root):
+        meta = os.path.join(root, name, CACHE_META)
+        try:
+            entries.append((os.path.getmtime(meta), name))
+        except OSError:
+            entries.append((0, name))   # incomplete entry
+    entries.sort(reverse=True)
+    now = time.time()
+    for i, (t, name) in enumerate(entries):
+        if i >= CACHE_MAX_ENTRIES or now - t > CACHE_KEEP_SECONDS:
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+
+
 # ---------------------------------------------------------------- export of one model
 def export_asset(root, key, out_dir, is_new, project='', node=''):
     """FBX + materials + source .blend of root and its children. For a prefab being modelled, also how the Blender
-    objects map onto the prefab's parts (by path inside the prefab) and how Unity should apply it (mode)."""
+    objects map onto the prefab's parts (by path inside the prefab) and how Unity should apply it (mode).
+    Unchanged since an earlier save or sync: the files come from the export cache instead (see above)."""
     d = os.path.join(out_dir, 'assets', key)
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d, exist_ok=True)
     parts = asset_parts(root)
+    material_mode = str(root.get('aa_material_mode', 'blender'))
+    sync_textures = bool(root.get('aa_sync_textures', True))
+    bpy.context.view_layer.update()
+    to_root = root.matrix_world.inverted_safe()
+    rel = {o: flat(to_root @ o.matrix_world) for o in parts}  # before the root is moved to the origin for export
+    h = asset_hash(root)
+    geo = [o for o in parts if o.type in GEO]
+    has_uv2 = any(o.type == 'MESH' and len(o.data.uv_layers) > 1 for o in geo)
+    sig = _cache_signature(root, parts, h, material_mode, sync_textures, project)
+    materials, cached = _cache_restore(sig, key, d)
+    if cached:
+        for o in parts:   # what the exporter would have fixed: the names the cached FBX uses
+            o['aa_fbx_name'] = fbx_name(o)
+    else:
+        materials = _write_files(root, key, d, parts, material_mode, sync_textures, project)
+        # stored under the state after the export: it packs external textures and fixes export names, which the next
+        # save will see, so a signature taken before would never match again
+        _cache_store(_cache_signature(root, parts, asset_hash(root), material_mode, sync_textures, project), key, d, materials)
+    root['aa_pending_hash'] = h
+    known = {o.get('aa_part') for o in geo if 'aa_part' in o}
+    original = json.loads(root.get('aa_orig_parts', '[]'))
+    return {'key': key, 'name': root.name, 'fbx': key + '.fbx', 'source': key + '.blend', 'sourceCollection': SOURCE_COLLECTION,
+            'mode': str(root.get('aa_edit_mode', '')), 'prefab': str(root.get('aa_prefab', '')), 'pivotMoved': pivot_moved(root),
+            'parts': [{'object': fbx_name(o), 'path': str(o.get('aa_part', '')), 'known': 'aa_part' in o, 'm': rel[o],
+                       'depth': _depth(o, parts)} for o in geo],
+            'removed': [p for p in original if p not in known],
+            'collider': str(root.get('collider', 'mesh')), 'hash': h, 'dir': d.replace('\\', '/'), 'isNew': is_new, 'node': node,
+            'hasUv2': has_uv2, 'materials': materials, 'materialMode': material_mode, 'syncTextures': sync_textures}
+
+
+def _write_files(root, key, d, parts, material_mode, sync_textures, project):
+    """The expensive part: textures, FBX and source .blend into d. Returns the material descriptions."""
     mats = []
     for o in parts:
         for s in getattr(o, 'material_slots', []):
             if s.material is not None and s.material not in mats:
                 mats.append(s.material)
-    material_mode = str(root.get('aa_material_mode', 'blender'))
-    sync_textures = bool(root.get('aa_sync_textures', True))
     images = M.Images(os.path.join(d, 'Textures'), project) if material_mode != 'unity' and sync_textures else None
-    bpy.context.view_layer.update()
-    to_root = root.matrix_world.inverted_safe()
-    rel = {o: flat(to_root @ o.matrix_world) for o in parts}  # before the root is moved to the origin for export
     materials = [M.reference(m) if material_mode == 'unity' else M.describe(m, images, sync_textures) for m in mats]
-    h = asset_hash(root)
-    geo = [o for o in parts if o.type in GEO]
-    has_uv2 = any(o.type == 'MESH' and len(o.data.uv_layers) > 1 for o in geo)
 
     saved, parent = root.matrix_world.copy(), root.parent
     coll = None
@@ -308,13 +471,4 @@ def export_asset(root, key, out_dir, is_new, project='', node=''):
                 bpy.data.collections.remove(coll)
             root.parent = parent
             root.matrix_world = saved
-    root['aa_pending_hash'] = h
-    known = {o.get('aa_part') for o in geo if 'aa_part' in o}
-    original = json.loads(root.get('aa_orig_parts', '[]'))
-    return {'key': key, 'name': root.name, 'fbx': key + '.fbx', 'source': key + '.blend', 'sourceCollection': SOURCE_COLLECTION,
-            'mode': str(root.get('aa_edit_mode', '')), 'prefab': str(root.get('aa_prefab', '')), 'pivotMoved': pivot_moved(root),
-            'parts': [{'object': fbx_name(o), 'path': str(o.get('aa_part', '')), 'known': 'aa_part' in o, 'm': rel[o],
-                       'depth': _depth(o, parts)} for o in geo],
-            'removed': [p for p in original if p not in known],
-            'collider': str(root.get('collider', 'mesh')), 'hash': h, 'dir': d.replace('\\', '/'), 'isNew': is_new, 'node': node,
-            'hasUv2': has_uv2, 'materials': materials, 'materialMode': material_mode, 'syncTextures': sync_textures}
+    return materials

@@ -492,6 +492,8 @@ namespace Auleek.BlenderBridge.Editor
                 GUILayout.Label(BBLauncher.VersionLabel(BBSettings.BlenderExe) + (BBSettings.BlenderExeIsDetected && File.Exists(BBSettings.BlenderExe) ? " (found automatically)" : ""), BBStyles.Hint);
             }
 
+            DrawContent(s);
+
             using (new EditorGUILayout.VerticalScope(BBStyles.Card))
             {
                 GUILayout.Label("Project (shared with the team)", BBStyles.Section);
@@ -542,6 +544,106 @@ namespace Auleek.BlenderBridge.Editor
             }
         }
 
+        static readonly GUIContent[] ContentOptions =
+        {
+            new GUIContent("Mesh objects only", "Mesh prefabs (props, buildings...) and, if ticked below, plain mesh objects such as roads. " +
+                                                "Lights, volumes, probes, cameras, FX, characters and empty helper objects stay in Unity, untouched."),
+            new GUIContent("Everything", "Every object: lights as lights, everything without a mesh as an empty (the behaviour before 0.4)."),
+        };
+
+        void DrawContent(BBSettings s)
+        {
+            using (new EditorGUILayout.VerticalScope(BBStyles.Card))
+            {
+                GUILayout.Label("What Blender gets (shared with the team)", BBStyles.Section);
+                int cur = s.MeshesOnly ? 0 : 1;
+                int now = EditorGUILayout.Popup(new GUIContent("Scene objects"), cur, ContentOptions);
+                if (now != cur) { s.sceneContent = now == 0 ? BBSettings.ContentMeshes : BBSettings.ContentAll; ContentChanged(s); }
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    GUILayout.FlexibleSpace();
+                    if (GUILayout.Button(new GUIContent("Preview for this scene", "Reads the scene with these rules (without starting Blender) and lists what Blender would get and what stays in Unity. Also logged to the Console."), EditorStyles.miniButton, GUILayout.Width(140)))
+                    {
+                        string text = PreviewContent();
+                        if (text != null) Message(text, MessageType.Info);
+                        GUIUtility.ExitGUI();
+                    }
+                }
+                if (!s.MeshesOnly)
+                {
+                    GUILayout.Label("Lights, volumes, probes and helper objects come along as lights and empties.", BBStyles.Hint);
+                    return;
+                }
+                bool loose = EditorGUILayout.ToggleLeft(new GUIContent("Also plain mesh objects (not prefabs)", "Objects with a MeshFilter and MeshRenderer that are not prefab instances, e.g. road, ground or kitbash meshes."), s.includeLooseMeshes);
+                if (loose != s.includeLooseMeshes) { s.includeLooseMeshes = loose; ContentChanged(s); }
+                GUILayout.Label("Skinned meshes (characters, creatures) are never sent. Groups are sent only when they hold something that is. " +
+                                "Objects Blender doesn't get are never changed by a sync; deleting their parent group in Blender moves them up a level instead.", BBStyles.Hint);
+                EditorGUILayout.Space(4);
+                string before = s.ContentSignature;
+                FolderList("Leave out objects with these components", "Class names, e.g. Volume, ProbeVolume, DecalProjector. Checked on the object itself and on a prefab's root.",
+                           s.skipComponents, false, "ComponentName");
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    GUILayout.FlexibleSpace();
+                    if (GUILayout.Button("Reset to defaults", EditorStyles.miniButton, GUILayout.Width(110)))
+                    { s.skipComponents = new List<string>(BBSettings.DefaultSkipComponents); s.SaveNow(); }
+                }
+                if (s.ContentSignature != before) ContentChanged(s);
+            }
+        }
+
+        [MenuItem("Tools/Blender Bridge: Preview What Blender Gets", false, 2001)]
+        static void PreviewContentMenu() => PreviewContent();
+
+        /// <summary>Runs the scene export with the current rules, without writing the session or starting Blender (converted
+        /// meshes go to the cache, so the next Open in Blender is quicker), and reports what is sent and what stays.</summary>
+        internal static string PreviewContent()
+        {
+            var scene = SceneManager.GetActiveScene();
+            if (string.IsNullOrEmpty(scene.path)) { Debug.LogWarning("[Blender Bridge] Save the scene first."); return null; }
+            var roots = EditableRoots(scene, out _);
+            var t0 = DateTime.Now;
+            var x = BBExport.Run(scene, roots);
+            var sent = new HashSet<string>(x.session.nodes.Select(n => n.id));
+            var all = BBUtil.AllObjects(scene);
+            var ids = BBUtil.Goids(all);
+            var leftOut = new Dictionary<string, int>();
+            for (int i = 0; i < all.Length; i++)
+            {
+                var go = all[i];
+                if (sent.Contains(ids[i])) continue;
+                bool inside = PrefabUtility.IsPartOfPrefabInstance(go) && !PrefabUtility.IsOutermostPrefabInstanceRoot(go) && !PrefabUtility.IsAddedGameObjectOverride(go);
+                if (inside) continue;   // the insides of a prefab go (or stay) with it
+                string what = PrefabUtility.IsOutermostPrefabInstanceRoot(go) ? "prefabs without a static mesh" : Describe(go);
+                leftOut[what] = (leftOut.TryGetValue(what, out var c) ? c : 0) + 1;
+            }
+            string stays = leftOut.Count == 0 ? "nothing" : string.Join(", ", leftOut.OrderByDescending(p => p.Value).Take(8).Select(p => $"{p.Value} {p.Key}")) +
+                                                          (leftOut.Count > 8 ? ", ..." : "");
+            string text = $"{scene.name}: Blender would get {x.Summary}. Stays in Unity: {stays}. ({(DateTime.Now - t0).TotalSeconds:0.0}s)";
+            Debug.Log("[Blender Bridge] " + text);
+            return text;
+        }
+
+        static readonly string[] NotableComponents =
+            { "Light", "ProbeVolume", "Volume", "ReflectionProbe", "LightProbeGroup", "Camera", "ParticleSystem", "SkinnedMeshRenderer", "PlayableDirector", "Canvas", "AudioSource" };
+
+        static string Describe(GameObject go)
+        {
+            var names = go.GetComponents<Component>().Where(c => c && !(c is Transform)).Select(c => c.GetType().Name).ToList();
+            if (names.Count == 0) return "empty objects";
+            foreach (var k in NotableComponents) if (names.Contains(k)) return k;
+            if (names.Contains("MeshFilter")) return "other meshes (LOD1+, skip list, or plain meshes off)";
+            if (names.All(n => n.EndsWith("Collider") || n == "Rigidbody")) return "collider-only objects";
+            return names[0];
+        }
+
+        void ContentChanged(BBSettings s)
+        {
+            s.SaveNow();
+            if (info != null && info.hasBlend)
+                Message("What Blender gets has changed. It applies the next time you Open in Blender > Start fresh (the open Blender file keeps what it had).", MessageType.Info);
+        }
+
         void DrawDestinations(BBSettings s)
         {
             GUILayout.Label("Art destinations", EditorStyles.boldLabel);
@@ -585,7 +687,7 @@ namespace Auleek.BlenderBridge.Editor
             if (plan != null) plan = BBPlanner.Build(plan.key, plan);
         }
 
-        static void FolderList(string title, string hint, List<string> list, bool folders)
+        static void FolderList(string title, string hint, List<string> list, bool folders, string newEntry = null)
         {
             var s = BBSettings.instance;
             GUILayout.Label(title, EditorStyles.boldLabel);
@@ -608,7 +710,7 @@ namespace Auleek.BlenderBridge.Editor
                         if (GUILayout.Button(new GUIContent("Add selected folder", "Folders selected in the Project window"), EditorStyles.miniButton, GUILayout.Width(130)))
                         { foreach (var p in sel) if (!list.Contains(p)) list.Add(p); s.SaveNow(); }
                 }
-                if (GUILayout.Button("Add", EditorStyles.miniButton, GUILayout.Width(50))) { list.Add(folders ? "Assets/" : "/_Archive/"); s.SaveNow(); }
+                if (GUILayout.Button("Add", EditorStyles.miniButton, GUILayout.Width(50))) { list.Add(newEntry ?? (folders ? "Assets/" : "/_Archive/")); s.SaveNow(); }
                 GUILayout.FlexibleSpace();
             }
         }

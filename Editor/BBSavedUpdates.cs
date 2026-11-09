@@ -36,5 +36,28 @@ namespace Auleek.BlenderBridge.Editor
             if(File.Exists(result)) File.Replace(tmp,result,null); else File.Move(tmp,result);
             File.Delete(pointer); return true;
         }
+
+        /// <summary>Every Blender save writes a complete update (result.json + exported models) into out/saved/&lt;id&gt;/.
+        /// Once a sync is applied, those folders are spent; without this they pile up for the life of the session. Folders
+        /// a pointer still names (the latest save, or a stale one kept for recovery) and very fresh ones (a save that is
+        /// being written right now) are kept.</summary>
+        public static void PruneSpent(string key)
+        {
+            try
+            {
+                string outDir = BBPaths.OutDir(key), root = Path.Combine(outDir, "saved");
+                if (!Directory.Exists(root)) return;
+                var keep = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var ptr in Directory.GetFiles(outDir, "saved-latest.json*"))
+                {
+                    var s = BBUtil.Read<Saved>(ptr);
+                    if (!string.IsNullOrEmpty(s?.result)) keep.Add(Path.GetFullPath(Path.GetDirectoryName(s.result)).TrimEnd(Path.DirectorySeparatorChar));
+                }
+                foreach (var d in Directory.GetDirectories(root))
+                    if (!keep.Contains(Path.GetFullPath(d).TrimEnd(Path.DirectorySeparatorChar)) && (DateTime.Now - Directory.GetLastWriteTime(d)).TotalMinutes > 2)
+                        Directory.Delete(d, true);
+            }
+            catch (Exception e) { Debug.LogWarning("[Blender Bridge] could not clean up saved Blender updates: " + e.Message); }
+        }
     }
 }

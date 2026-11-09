@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.5.0
+
+### Changed
+- Meshes drawn with an effect shader stay in Unity: a mesh is left out when all its materials use a shader whose name
+  contains Fog, Haze, Volumetric or Particles/ (e.g. local volumetric fog and haze cubes). The list is editable in
+  Settings > What Blender gets. Start fresh to apply.
+- Saving in Blender no longer re-exports models that didn't change since the last save or sync. Exports are cached
+  by content in the session's `out/export_cache/` (hard links, so no extra disk for unchanged files) and linked into
+  the new update; unsynced new models, which get a new key on every save, are renamed to it. The FBX exporter and
+  the source .blend only run for models that actually changed. Entries unused for 3 days are removed.
+
+## 0.4.0
+
+Open each scene once with **Start fresh** to get the new content rules (an open Blender file keeps what it had).
+
+### Changed
+- Blender gets only mesh objects by default: mesh prefabs (props, buildings, vehicles...) and plain mesh objects
+  (roads, ground). Lights, volumes, Adaptive Probe Volumes, reflection probes, cameras, FX, characters (skinned
+  meshes), UI and empty helper objects stay in Unity and are never touched by a sync. Groups come along only when
+  something under them does. Settings > What Blender gets: switch plain meshes off, edit the component skip list, or
+  go back to "Everything".
+- The Blender asset library leaves out prefabs without a static mesh (FX, light rigs, characters, managers). The
+  decision is cached, so unchanged prefabs are not loaded again on the next Open in Blender.
+
+### Added
+- **Preview for this scene** (Settings > What Blender gets, or Tools > Blender Bridge: Preview What Blender Gets):
+  reads the scene with the current rules without starting Blender and reports what is sent and what stays in Unity.
+
+### Fixed
+- Deleting a group in Blender no longer deletes the objects under it that Blender doesn't show; they move up a level.
+- Every Blender save left a full update (result + exported models) in `out/saved/` forever; spent ones are removed
+  after each applied sync.
+- Blender re-read session.json several times every 2 seconds and on every sidebar redraw (laggy in big scenes);
+  it is parsed once per change now.
+- Placing many plain meshes looked up the Blender asset registry once per object; once per mesh now.
+
 ## 0.3.0
 
 - Shared release version in the Unity window and Blender sidebar; package.json is authoritative.

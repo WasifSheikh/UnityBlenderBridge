@@ -69,6 +69,39 @@ namespace Auleek.BlenderBridge.Editor
             return d;
         }
 
+        // ================================================================ deleting
+        /// <summary>Objects under a plain object that were not sent to Blender (content rules: lights, volumes, probes...).
+        /// The Blender user never saw them, so deleting their parent there must not delete them. A prefab instance is
+        /// different: what was added under it belongs to it and goes with it.</summary>
+        public static List<Transform> HiddenChildren(BBPlan plan, GameObject go)
+        {
+            var list = new List<Transform>();
+            if (go && !PrefabUtility.IsPartOfPrefabInstance(go)) CollectHidden(plan, go.transform, list);
+            return list;
+        }
+
+        // through children Blender does show (they are deleted with it, possibly after it), down to the hidden ones
+        static void CollectHidden(BBPlan plan, Transform t, List<Transform> list)
+        {
+            foreach (Transform c in t)
+            {
+                if (!plan.nodeObjects.Contains(c.gameObject)) list.Add(c);
+                else if (!PrefabUtility.IsPartOfPrefabInstance(c.gameObject)) CollectHidden(plan, c, list);
+            }
+        }
+
+        /// <summary>Moves the hidden children of an object Blender deleted up to its parent, keeping their world placement
+        /// (as Blender does with the children of a deleted object).</summary>
+        public static void KeepHiddenChildren(BBCtx ctx, GameObject go)
+        {
+            var hidden = HiddenChildren(ctx.plan, go);
+            if (hidden.Count == 0) return;
+            var parent = go.transform.parent;
+            foreach (var c in hidden) Undo.SetTransformParent(c, parent, "Keep hidden child");
+            ctx.log.Add($"{go.name} was deleted in Blender; {hidden.Count} object(s) under it that Blender doesn't show were kept: " +
+                        string.Join(", ", hidden.Take(5).Select(c => c.name)) + (hidden.Count > 5 ? ", ..." : ""));
+        }
+
         // ================================================================ new objects
         /// <summary>A Shift+D copy: Unity duplicates the original (prefab links, overrides, components kept). Children of the
         /// original that Blender knows as their own objects are removed from the copy: Blender sends them as their own copies

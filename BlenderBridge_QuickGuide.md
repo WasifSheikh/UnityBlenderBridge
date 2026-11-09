@@ -13,6 +13,8 @@ For Alien Armageddon / ProjectAlienShooter. Verified against the local bridge im
 7. Click **Sync to Unity**. Clean changes apply automatically; otherwise resolve the choices in Unity's review and click **Apply**.
 8. Wait for Unity's acknowledgement before continuing another sync.
 
+Only mesh objects come into Blender (mesh prefabs such as props and buildings, plus plain meshes such as roads). Lights, volumes, probes, cameras, FX, characters and empty helpers stay in Unity and are never changed by a sync. Change this under **Settings → What Blender gets**, then use **Start fresh**.
+
 Unity remains the authority for the level layout. Keep unsynced Blender work in its current session until you have either applied it to Unity or saved a separate copy.
 
 ## 2. Where the Blender files are saved

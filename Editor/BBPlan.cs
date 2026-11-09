@@ -172,11 +172,13 @@ namespace Auleek.BlenderBridge.Editor
                 string id = s.id;
                 string uParent = go.transform.parent && idOf.TryGetValue(go.transform.parent.gameObject, out var up) ? up : "";
                 bool uChanged = !BBConvert.Near(ULocal(go), SLocal(s)) || uParent != (s.parent ?? "");
+                int hidden = BBSceneOps.HiddenChildren(plan, go).Count;
+                string keep = hidden == 0 ? "" : $" ({hidden} object{(hidden == 1 ? "" : "s")} under it that Blender doesn't show, e.g. lights or volumes, are kept and move up one level)";
                 plan.items.Add(new BBItem
                 {
                     kind = uChanged ? BBKind.Conflict : BBKind.Delete, change = BBKind.Delete, id = s.id, field = "delete", target = go, choice = true, apply = !uChanged,
-                    phase = BBPhase.Delete, text = uChanged ? $"{s.name}: deleted in Blender, but moved in Unity since. Kept unless ticked." : $"{s.name}: deleted in Blender",
-                    run = ctx => { if (target) { ctx.deleted.Add(id); Undo.DestroyObjectImmediate(target); } },
+                    phase = BBPhase.Delete, text = (uChanged ? $"{s.name}: deleted in Blender, but moved in Unity since. Kept unless ticked." : $"{s.name}: deleted in Blender") + keep,
+                    run = ctx => { if (target) { ctx.deleted.Add(id); BBSceneOps.KeepHiddenChildren(ctx, target); Undo.DestroyObjectImmediate(target); } },
                 });
             }
 

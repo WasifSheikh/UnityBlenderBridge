@@ -32,6 +32,31 @@ namespace Auleek.BlenderBridge.Editor
         public bool defaultSyncTextures = true;
         public bool autoApply = true;
 
+        // ---------------------------------------------------------------- what Blender gets
+        public const string ContentMeshes = "meshes", ContentAll = "all";
+        /// <summary>"meshes": only mesh prefabs (props, buildings, roads...) and, if <see cref="includeLooseMeshes"/>, plain
+        /// mesh objects go to Blender; lights, volumes, probes, cameras, FX and empty helper objects stay in Unity, untouched.
+        /// "all": the old behaviour (every object, lights as lights, the rest as empties).</summary>
+        public string sceneContent = ContentMeshes;
+        /// <summary>Plain (non-prefab) objects with a MeshFilter + MeshRenderer, e.g. road and ground meshes.</summary>
+        public bool includeLooseMeshes = true;
+        /// <summary>Objects (or prefab roots) carrying one of these components are left in Unity even when they have a mesh.
+        /// Matched by class name, so render-pipeline types need no assembly reference.</summary>
+        public List<string> skipComponents = new List<string>(DefaultSkipComponents);
+        public static readonly string[] DefaultSkipComponents =
+        {
+            "Volume", "ProbeVolume", "ProbeAdjustmentVolume", "ProbeVolumePerSceneData", "ReflectionProbe", "LightProbeGroup",
+            "LightProbeProxyVolume", "LocalVolumetricFog", "DecalProjector", "Camera", "PlayableDirector", "Canvas",
+            "VisualEffect", "Terrain", "TextMeshPro", "TextMesh",
+        };
+
+        public bool MeshesOnly => sceneContent != ContentAll;
+
+        /// <summary>Changes whenever the content rules change, so cached decisions about library prefabs are redone.</summary>
+        public string ContentSignature => MeshesOnly
+            ? "meshes|" + includeLooseMeshes + "|" + string.Join(",", skipComponents.Select(x => x.Trim()).Where(x => x.Length > 0).OrderBy(x => x, StringComparer.Ordinal))
+            : "all";
+
         public void SaveNow() => Save(true);
 
         public SceneRoots For(string sceneGuid, bool create)
